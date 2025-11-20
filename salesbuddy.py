@@ -4,24 +4,21 @@ import os
 import google.generativeai as genai
 
 # ---------------------- CONFIG -----------------------------
-
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Local path to Excel in the cloned repo
+# Paths for Excel, background and logo
 SALES_DATA_PATH = "salesbuddy.xlsx"
+BACKGROUND_IMAGE_PATH = "background.jpg"
+LOGO_IMAGE_PATH = "zodopt.png"
 
-# ⚠️ REPLACE WITH YOUR REAL KEY
-# Note: For production, store this securely (e.g., Streamlit Secrets)
 GEMINI_API_KEY = "AIzaSyBgKTlULVARw37Ec0WCor0YFC3cHXq64Mc"
 
-# Define the columns that are essential for analysis
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
     "Street", "City", "State", "Country", "Zip Code",
     "First Name", "Last Name", "Annual Revenue", "Lead Status" 
 ]
 
-# Lead statuses that cannot be converted
 DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 
 # ---------------------- FUNCTIONS --------------------------
@@ -30,10 +27,9 @@ DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 def load_sales_data(file_path, required_cols):
     if not os.path.exists(file_path):
         return None, f"❌ File not found at: {file_path}"
-
     try:
         df = pd.read_excel(file_path)
-        df.columns = df.columns.str.strip()  # Clean column names
+        df.columns = df.columns.str.strip()
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
             return None, f"❌ Missing essential columns: {', '.join(missing)}" 
@@ -43,18 +39,15 @@ def load_sales_data(file_path, required_cols):
     except Exception as e:
         return None, f"❌ Error reading Excel: {e}"
 
-
 def filter_data_context(df, query):
     df_working = df.copy()
     query_lower = query.lower()
     
-    # Status filter
     potential_phrases = ["possibility to be turned into sales", "best leads", "potential sales", "hot leads", "convertible", "most valuable"]
     if any(phrase in query_lower for phrase in potential_phrases):
         df_working = df_working[~df_working['Lead Status'].isin(DISQUALIFYING_STATUSES)]
         st.caption("Status filter applied: Excluding permanently disqualified leads.")
         
-    # Location filter
     locations = ["bangalore", "bengaluru", "new york", "london", "california", "india", "texas", "washington", "oregon", "canada"]
     location_match = next((loc for loc in locations if loc in query_lower), None)
 
@@ -74,18 +67,12 @@ def filter_data_context(df, query):
             
     return df_working.to_csv(index=False, sep="\t")
 
-
 def get_training_examples():
     return """ 
 --- TRAINING EXAMPLES (RESTRICTED COLUMNS) ---
-# Add all 30 examples here (same as your original code)
-# Example 1: ...
-# Example 2: ...
-# ...
-# Example 30: ...
+# Include your 30 examples here
 --- END TRAINING EXAMPLES ---
 """
-
 
 def ask_gemini(question, data_context):
     try:
@@ -119,13 +106,52 @@ def ask_gemini(question, data_context):
     except Exception as e:
         return f"❌ Gemini API Error: {e}"
 
-
 # ---------------------- STREAMLIT UI ------------------------
+
+def set_background_and_logo():
+    if os.path.exists(BACKGROUND_IMAGE_PATH):
+        with open(BACKGROUND_IMAGE_PATH, "rb") as f:
+            bg_data = f.read()
+        st.markdown(
+            f"""
+            <style>
+            .stApp {{
+                background-image: url(data:image/jpg;base64,{bg_data.encode("base64")});
+                background-size: cover;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+    if os.path.exists(LOGO_IMAGE_PATH):
+        st.image(LOGO_IMAGE_PATH, width=120, use_column_width=False, output_format="PNG")
 
 def main():
     st.set_page_config(page_title="ZODOPT Sales Buddy", layout="wide")
-    st.title("💰 ZODOPT Sales Buddy Agent")
-    st.subheader("AI-Powered CRM & Sales Insights")
+    
+    # Custom CSS for header layout
+    st.markdown(
+        """
+        <style>
+        .header-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    
+    # Header with title and logo on right
+    logo_col, title_col = st.columns([6,1])
+    with title_col:
+        if os.path.exists(LOGO_IMAGE_PATH):
+            st.image(LOGO_IMAGE_PATH, width=100)
+    with logo_col:
+        st.title("💰 ZODOPT Sales Buddy Agent")
+        st.subheader("AI-Powered CRM & Sales Insights")
+
     st.divider()
 
     df_filtered, load_message = load_sales_data(SALES_DATA_PATH, REQUIRED_COLS)
@@ -143,7 +169,6 @@ def main():
             {"role": "ai", "content": "Hello! I'm ZODOPT Sales Buddy. Ask me about Lead Source, Annual Revenue, Lead Owner, Lead Status, or Location."}
         ]
 
-    # Display chat
     for msg in st.session_state.chat:
         if msg["role"] == "user":
             st.markdown(f"<div style='background:#E6F7FF;padding:10px;border-radius:8px;text-align:right'>{msg['content']}</div>", unsafe_allow_html=True)
@@ -159,7 +184,6 @@ def main():
             response = ask_gemini(user_input, context_text)
         st.session_state.chat.append({"role": "ai", "content": response})
         st.rerun()
-
 
 if __name__ == "__main__":
     main()
