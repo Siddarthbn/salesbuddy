@@ -2,14 +2,15 @@ import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
+import base64
 
 # ---------------------- CONFIG -----------------------------
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # Paths for Excel, background and logo
-SALES_DATA_PATH = "salesbuddy.xlsx"
-BACKGROUND_IMAGE_PATH = "background.jpg"
-LOGO_IMAGE_PATH = "zodopt.png"
+SALES_DATA_PATH = "salesbuddy/salesbuddy.xlsx"
+BACKGROUND_IMAGE_PATH = "salesbuddy/background.jpg"
+LOGO_IMAGE_PATH = "salesbuddy/zodopt.png"
 
 GEMINI_API_KEY = "AIzaSyBgKTlULVARw37Ec0WCor0YFC3cHXq64Mc"
 
@@ -35,7 +36,7 @@ def load_sales_data(file_path, required_cols):
             return None, f"❌ Missing essential columns: {', '.join(missing)}" 
         df_filtered = df[required_cols]
         df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce')
-        return df_filtered, "Sales data loaded successfully! Ready for AI analysis."
+        return df_filtered, None  # Removed success message
     except Exception as e:
         return None, f"❌ Error reading Excel: {e}"
 
@@ -46,7 +47,6 @@ def filter_data_context(df, query):
     potential_phrases = ["possibility to be turned into sales", "best leads", "potential sales", "hot leads", "convertible", "most valuable"]
     if any(phrase in query_lower for phrase in potential_phrases):
         df_working = df_working[~df_working['Lead Status'].isin(DISQUALIFYING_STATUSES)]
-        st.caption("Status filter applied: Excluding permanently disqualified leads.")
         
     locations = ["bangalore", "bengaluru", "new york", "london", "california", "india", "texas", "washington", "oregon", "canada"]
     location_match = next((loc for loc in locations if loc in query_lower), None)
@@ -58,11 +58,7 @@ def filter_data_context(df, query):
             df_working['Country'].astype(str).str.lower().str.contains(location_match, na=False)
         )
         df_working = df_working[location_mask]
-        
-        if not df_working.empty:
-            st.caption(f"Location filter applied: Analyzing **{len(df_working)}** leads matching **'{location_match.title()}'**.")
-        else:
-            st.warning(f"No leads found for '{location_match.title()}' after status filtering.")
+        if df_working.empty:
             df_working = df.head(0)
             
     return df_working.to_csv(index=False, sep="\t")
@@ -108,49 +104,37 @@ def ask_gemini(question, data_context):
 
 # ---------------------- STREAMLIT UI ------------------------
 
-def set_background_and_logo():
-    if os.path.exists(BACKGROUND_IMAGE_PATH):
-        with open(BACKGROUND_IMAGE_PATH, "rb") as f:
-            bg_data = f.read()
+def set_background_image(image_path):
+    if os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode()
         st.markdown(
             f"""
             <style>
             .stApp {{
-                background-image: url(data:image/jpg;base64,{bg_data.encode("base64")});
+                background-image: url("data:image/jpg;base64,{encoded}");
                 background-size: cover;
+                background-attachment: fixed;
             }}
             </style>
             """,
             unsafe_allow_html=True
         )
-    if os.path.exists(LOGO_IMAGE_PATH):
-        st.image(LOGO_IMAGE_PATH, width=120, use_column_width=False, output_format="PNG")
 
 def main():
     st.set_page_config(page_title="ZODOPT Sales Buddy", layout="wide")
     
-    # Custom CSS for header layout
-    st.markdown(
-        """
-        <style>
-        .header-container {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-    
-    # Header with title and logo on right
-    logo_col, title_col = st.columns([6,1])
-    with title_col:
-        if os.path.exists(LOGO_IMAGE_PATH):
-            st.image(LOGO_IMAGE_PATH, width=100)
-    with logo_col:
+    # Set background
+    set_background_image(BACKGROUND_IMAGE_PATH)
+
+    # Header with title and logo
+    header_col, logo_col = st.columns([6,1])
+    with header_col:
         st.title("💰 ZODOPT Sales Buddy Agent")
         st.subheader("AI-Powered CRM & Sales Insights")
+    with logo_col:
+        if os.path.exists(LOGO_IMAGE_PATH):
+            st.image(LOGO_IMAGE_PATH, width=100)
 
     st.divider()
 
@@ -158,8 +142,6 @@ def main():
     if df_filtered is None:
         st.error(load_message)
         st.stop()
-    else:
-        st.success(load_message)
 
     st.divider()
     st.write("### 💬 Chat with Sales Buddy")
