@@ -8,7 +8,7 @@ import google.generativeai as genai
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # Local path to Excel in the cloned repo
-SALES_DATA_PATH = "salesbuddy/salesbuddy.xlsx"
+SALES_DATA_PATH = "salesbuddy.xlsx"
 
 # ⚠️ REPLACE WITH YOUR REAL KEY
 # Note: For production, store this securely (e.g., Streamlit Secrets)
