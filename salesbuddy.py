@@ -8,9 +8,9 @@ import base64
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # Paths for Excel, background and logo
-SALES_DATA_PATH = "salesbuddy/salesbuddy.xlsx"
-BACKGROUND_IMAGE_PATH = "salesbuddy/background.jpg"
-LOGO_IMAGE_PATH = "salesbuddy/zodopt.png"
+SALES_DATA_PATH = "salesbuddy.xlsx"
+BACKGROUND_IMAGE_PATH = "background.jpg"
+LOGO_IMAGE_PATH = "zodopt.png"
 
 GEMINI_API_KEY = "AIzaSyBgKTlULVARw37Ec0WCor0YFC3cHXq64Mc"
 
