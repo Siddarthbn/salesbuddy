@@ -3,11 +3,12 @@ import pandas as pd
 import os
 import google.generativeai as genai
 import base64
+import mimetypes
 
 # ---------------------- CONFIG -----------------------------
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Paths for Excel, background and logo
+# Paths
 SALES_DATA_PATH = "salesbuddy.xlsx"
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
@@ -36,7 +37,7 @@ def load_sales_data(file_path, required_cols):
             return None, f"❌ Missing essential columns: {', '.join(missing)}" 
         df_filtered = df[required_cols]
         df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce')
-        return df_filtered, None  # Removed success message
+        return df_filtered, None
     except Exception as e:
         return None, f"❌ Error reading Excel: {e}"
 
@@ -102,30 +103,78 @@ def ask_gemini(question, data_context):
     except Exception as e:
         return f"❌ Gemini API Error: {e}"
 
-# ---------------------- STREAMLIT UI ------------------------
-
-def set_background_image(image_path):
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode()
-        st.markdown(
-            f"""
+# ---------------------- BACKGROUND --------------------------
+def set_background(image_path):
+    """Sets the app background using custom CSS."""
+    try:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Background image not found at: {image_path}")
+            
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type or not mime_type.startswith('image/'):
+            mime_type = 'image/jpeg'
+            
+        with open(image_path, "rb") as img_file:
+            encoded = base64.b64encode(img_file.read()).decode()
+            
+        st.markdown(f"""
             <style>
+            [data-testid="stAppViewContainer"] {{ padding: 0 !important; margin: 0 !important; background-color: transparent !important; }}
+            [data-testid="stHeader"] {{ background: rgba(0,0,0,0) !important; }}
+            .main .block-container {{
+                background-color: transparent !important;
+                padding-top: 3rem; 
+                padding-bottom: 3rem;
+                max-width: 100% !important; 
+                padding-left: 5rem; 
+                padding-right: 5rem;
+            }}
             .stApp {{
-                background-image: url("data:image/jpg;base64,{encoded}");
-                background-size: cover;
-                background-attachment: fixed;
+                background-image: url("data:{mime_type};base64,{encoded}");
+                background-size: cover !important; 
+                background-repeat: no-repeat !important; 
+                background-position: center !important; 
+                background-attachment: fixed !important;
+                min-height: 100vh !important; 
+                padding: 0 !important;
+                margin: 0 !important;
+            }}
+            h1, h2, h3, h4, h5, h6, p, label, .stMarkdown, .stText, div[data-testid="stCaption"] {{
+                color: #1f1f1f !important; 
+                text-shadow: 1px 1px 2px rgba(255, 255, 255, 0.9); 
+            }}
+            .stTextInput > div > div > input, 
+            .stSelectbox > div > button,
+            .stDateInput > div > div > input,
+            .stForm {{
+                background-color: rgba(255, 255, 255, 0.8) !important; 
+                border-radius: 8px;
+            }}
+            [data-testid="stHorizontalBlock"] > div > div:has(> .log-content) {{
+                background-color: white !important;
+                border-radius: 15px;
+                padding: 20px;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); 
+                height: 100%; 
+            }}
+            .log-content h3, .log-content .stMarkdown strong, .log-content p {{
+                   color: #1f1f1f !important; 
+                   text-shadow: none !important; 
+            }}
+            .log-content .st-emotion-cache-1ft30t7 {{ 
+                   color: #555555 !important;
             }}
             </style>
-            """,
-            unsafe_allow_html=True
-        )
+        """, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Error setting background: {e}")
+
+# ---------------------- STREAMLIT UI ------------------------
 
 def main():
     st.set_page_config(page_title="ZODOPT Sales Buddy", layout="wide")
     
-    # Set background
-    set_background_image(BACKGROUND_IMAGE_PATH)
+    set_background(BACKGROUND_IMAGE_PATH)
 
     # Header with title and logo
     header_col, logo_col = st.columns([6,1])
