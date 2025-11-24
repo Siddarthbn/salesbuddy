@@ -4,16 +4,20 @@ import os
 import google.generativeai as genai
 import base64
 import mimetypes
+import boto3
+import io
 
-# ---------------------- CONFIG -----------------------------
-GEMINI_MODEL = "gemini-2.5-flash"
+# ---------------------- AWS S3 CONFIG --------------------------
+# Set these variables to match your AWS setup
+S3_BUCKET_NAME = "zodopt"
+S3_FILE_KEY = "Leads by Status.xlsx"               
+AWS_REGION = "ap-south-1"                      
 
-# Paths on EC2 (inside your cloned repo)
-SALES_DATA_PATH = "salesbuddy.xlsx"
+# Paths for local assets (used only for images/styling)
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
 
-GEMINI_API_KEY = "AIzaSyBgKTlULVARw37Ec0WCor0YFC3cHXq64Mc"
+GEMINI_API_KEY = "AIzaSyBgKTlULVARw37Ec0WCor0YFC3cHXq64Mc" # Use environment variables in production
 
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
@@ -26,23 +30,34 @@ DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 # ---------------------- FUNCTIONS --------------------------
 
 @st.cache_data(ttl=600)
-def load_sales_data(file_path, required_cols):
-    if not os.path.exists(file_path):
-        return None, f"❌ File not found at: {file_path}"
+def load_sales_data_from_s3(bucket_name, file_key, required_cols):
+    """Loads the Excel file directly from S3 into a Pandas DataFrame."""
     try:
-        df = pd.read_excel(file_path)
+        # boto3 automatically picks up credentials from the EC2 Instance Profile (IAM Role)
+        s3 = boto3.client('s3', region_name=AWS_REGION)
+        
+        # Download the file object from S3
+        response = s3.get_object(Bucket=bucket_name, Key=file_key)
+        
+        # Read the Excel data into a BytesIO object (in-memory file)
+        excel_data = response['Body'].read()
+        df = pd.read_excel(io.BytesIO(excel_data))
+        
         df.columns = df.columns.str.strip()
 
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            return None, f"❌ Missing essential columns: {', '.join(missing)}"
+            return None, f"❌ Missing essential columns: {', '.join(missing)}. Check your file structure."
 
         df_filtered = df[required_cols]
-        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='ignore')
+        # Use errors='coerce' to turn non-numeric values into NaN, then fill with 0
+        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce').fillna(0)
+        
         return df_filtered, None
 
     except Exception as e:
-        return None, f"❌ Error reading Excel: {e}"
+        # Catch S3/Boto3 errors (e.g., AccessDenied, NoSuchKey)
+        return None, f"❌ S3/Boto3 Error: Failed to load data from s3://{bucket_name}/{file_key}. Details: {e}"
 
 
 def filter_data_context(df, query):
@@ -74,7 +89,7 @@ def filter_data_context(df, query):
 def ask_gemini(question, data_context):
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        model = genai.GenerativeModel("gemini-2.5-flash") # Hardcoding the model as requested
 
         prompt = f"""
 You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
@@ -162,7 +177,7 @@ def main():
 
     st.set_page_config(
         page_title="ZODOPT Sales Buddy",
-        page_icon=LOGO_IMAGE_PATH,   # CUSTOM FAVICON
+        page_icon=LOGO_IMAGE_PATH,
         layout="wide"
     )
 
@@ -180,8 +195,8 @@ def main():
 
     st.divider()
 
-    # Load data
-    df_filtered, load_msg = load_sales_data(SALES_DATA_PATH, REQUIRED_COLS)
+    # Load data from S3
+    df_filtered, load_msg = load_sales_data_from_s3(S3_BUCKET_NAME, S3_FILE_KEY, REQUIRED_COLS)
     if df_filtered is None:
         st.error(load_msg)
         st.stop()
@@ -191,7 +206,7 @@ def main():
 
     if "chat" not in st.session_state:
         st.session_state.chat = [
-            {"role": "ai", "content": "Hello! Ask me anything about your CRM leads."}
+            {"role": "ai", "content": f"Hello! I've loaded {len(df_filtered)} leads from S3. Ask me anything about your CRM leads."}
         ]
 
     # Render chat
