@@ -1,7 +1,10 @@
+# Sales Buddy
+
 import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
+# ❌ REMOVED: from google.generativeai.types import Part (Still removed to avoid errors)
 import base64
 import mimetypes
 import boto3 
@@ -9,11 +12,6 @@ from botocore.exceptions import ClientError
 from io import BytesIO
 import json
 import tempfile 
-import warnings # Re-adding warnings module for robust operation
-
-# Suppress the openpyxl UserWarning that occurs on loading the Excel file
-# This warning is common when reading files and doesn't affect functionality.
-warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl") 
 
 # ---------------------- AWS CONFIG --------------------------
 # Set these variables to match your AWS setup
@@ -31,13 +29,6 @@ GEMINI_MODEL = "gemini-2.5-flash"
 # Paths for local assets (used only for images/styling)
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
-
-# --- TOKEN-SAVING CONFIGURATION ---
-# Max leads to sample and send for analysis to prevent quota errors and save tokens
-MAX_LEADS_TO_SEND = 150 
-# Only send the most essential columns to save tokens.
-CORE_ANALYSIS_COLS = ["Record Id", "Full Name", "Company", "Lead Status", "Annual Revenue", "City"]
-
 
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
@@ -96,8 +87,7 @@ def load_data_from_s3(bucket_name, file_key, required_cols):
             return None, f"❌ Missing essential columns: **{', '.join(missing)}**"
 
         df_filtered = df[required_cols]
-        # Ensure Annual Revenue is numeric, coercing errors to NaN, then filling with 0
-        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce').fillna(0)
+        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce')
         return df_filtered, None
 
     except ClientError as e:
@@ -108,20 +98,21 @@ def load_data_from_s3(bucket_name, file_key, required_cols):
         return None, f"❌ Error reading/processing data: {e}"
 
 
+# ✅ REVERTED: Now returns a CSV string for the prompt
 def filter_data_context(df, query):
     """
-    Filters the DataFrame based on smart keywords, samples rows, and returns the filtered 
-    data as a tab-separated CSV string AND the count of leads sent.
+    Filters the DataFrame based on smart keywords and returns the filtered 
+    data as a tab-separated CSV string for the LLM prompt.
     """
     df_working = df.copy()
     query_lower = query.lower()
-    
-    # --- 1. Smart Filtering based on Query Keywords ---
+
+    # Smart lead filtering: Exclude disqualified leads for "best/hot" queries
     key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility", "high value"]
     if any(p in query_lower for p in key_phrases):
         df_working = df_working[~df_working["Lead Status"].isin(DISQUALIFYING_STATUSES)]
 
-    # Filter by location keywords
+    # Location extraction
     locations = ["bangalore", "bengaluru", "delhi", "new york", "london", "texas", "india"]
     loc_match = next((loc for loc in locations if loc in query_lower), None)
 
@@ -132,80 +123,47 @@ def filter_data_context(df, query):
             df_working["Country"].astype(str).str.lower().str.contains(loc_match, na=False)
         )
         df_working = df_working[mask]
-    
-    # --- 2. Token Optimization: Column Reduction and Sampling ---
-    if df_working.empty:
-        return df.head(0).to_csv(index=False, sep="\t"), 0
-        
-    cols_to_send = [col for col in CORE_ANALYSIS_COLS if col in df_working.columns]
-    df_working = df_working[cols_to_send]
+        if df_working.empty:
+            df_working = df.head(0) 
 
-    original_lead_count = len(df_working)
-
-    if original_lead_count > MAX_LEADS_TO_SEND:
-        # Prioritize leads by highest Annual Revenue before sampling
-        df_working = df_working.sort_values(by='Annual Revenue', ascending=False)
-        df_working = df_working.head(MAX_LEADS_TO_SEND)
-    
-    count_sent = len(df_working)
-    
-    # Return the data as a tab-separated string AND the count of leads sent
-    return df_working.to_csv(index=False, sep="\t"), count_sent
+    # Return the data as a tab-separated string
+    return df_working.to_csv(index=False, sep="\t")
 
 
-# ---------------------- GEMINI INTERACTION --------------------------
-
-def ask_gemini(question, data_context, api_key, count_sent):
+# ✅ REVERTED: Now accepts a CSV string and puts it directly in the prompt
+def ask_gemini(question, data_context, api_key):
     """
-    Sends the question and filtered data context (as a string) to the Gemini API,
-    including the count of records for context.
+    Sends the question and filtered data context (as a string) to the Gemini API.
     """
     try:
         genai.configure(api_key=api_key)
+        # Assuming you can instantiate GenerativeModel without the Client object
         model = genai.GenerativeModel(GEMINI_MODEL) 
 
-        # --- REFINED PROMPT STRUCTURE (The "questions training the model part") ---
         prompt = f"""
-You are ZODOPT Sales Buddy, a highly accurate and senior sales analyst. You strictly analyze ONLY the following tab-separated CRM lead data.
-The dataset contains a subset of records for analysis, totaling {count_sent} leads.
-Your analysis MUST be limited exclusively to the provided subset. Do not guess, speculate, or hallucinate any values outside the dataset.
-Ensure all numerical calculations (like sums, averages, counts, distributions) are mathematically accurate based on the data provided.
+You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
+Do not guess or hallucinate any values outside the dataset.
 
---- DATASET (Tab-Separated) ---
+--- DATASET ---
 {data_context}
 
 --- QUESTION ---
 {question}
 
-Provide clear, structured, and actionable bullet-point insights based ONLY on the data provided.
-If the answer requires comparing groups or summarizing distributions, use Markdown tables for clarity (e.g., Lead Status | Count | Avg Revenue).
+Provide structured bullet-point insights, using the data fields provided.
 """
-        # --- END REFINED PROMPT ---
 
         response = model.generate_content(prompt)
-        
-        # Enhanced error handling for stability
-        if response.text:
-            return response.text
-        
-        if response.candidates:
-            finish_reason = response.candidates[0].finish_reason.name
-            
-            if finish_reason == "SAFETY":
-                safety_ratings = response.candidates[0].safety_ratings
-                reasons = [f"{r.category.name}: {r.probability.name}" for r in safety_ratings]
-                return f"❌ **Analysis Blocked (Safety):** The prompt or data violated safety policies. Safety Reasons: {', '.join(reasons)}"
-            
-            if finish_reason != "STOP":
-                 return f"⚠️ **Model Generation Failed:** The model stopped for reason: {finish_reason}. Try rephrasing your question or reducing complexity."
-
-        return "⚠️ **Generation Error:** The model returned an empty response. Please try again or rephrase your question."
+        return response.text
 
     except Exception as e:
-        return f"❌ Gemini API Error: An exception occurred during the API call: {e}"
+        # Check if the error is the expected one, and if not, show the real error
+        if "has no attribute 'Client'" in str(e):
+            return "❌ Gemini API Configuration Error: The installed SDK version is too old. Please try updating it (`pip install --upgrade google-generativeai`)."
+        return f"❌ Gemini API Error: {e}"
 
 
-# ---------------------- STYLING AND UI FUNCTIONS ----------------------
+# ---------------------- BACKGROUND CSS ----------------------
 def set_background(image_path):
     """Sets the Streamlit app background using CSS."""
     try:
@@ -221,11 +179,9 @@ def set_background(image_path):
 
         st.markdown(f"""
             <style>
-            /* Streamlit layout adjustments */
             [data-testid="stAppViewContainer"] {{ padding: 0 !important; margin: 0 !important; background-color: transparent !important; }}
             [data-testid="stHeader"] {{ background: rgba(0,0,0,0) !important; }}
 
-            /* Full-page background image */
             .stApp {{
                 background-image: url("data:{mime_type};base64,{encoded_image}");
                 background-size: cover !important;
@@ -234,7 +190,6 @@ def set_background(image_path):
                 background-attachment: fixed !important;
             }}
 
-            /* Content container styling for better readability */
             .main .block-container {{
                 background: transparent !important;
                 padding-top: 3rem;
@@ -242,13 +197,11 @@ def set_background(image_path):
                 padding-right: 4rem;
             }}
 
-            /* Text styling for visibility against background */
             h1, h2, h3, p, label, .stMarkdown, .stSelectbox label, .stButton button {{
                 color: #111 !important;
                 text-shadow: 0.5px 0.5px 1px rgba(255,255,255,0.8);
             }}
 
-            /* Custom chat bubble styling */
             .chat-bubble-user {{
                 background: rgba(230,247,255,0.8);
                 padding: 10px;
@@ -310,15 +263,14 @@ def main():
         st.error(load_msg)
         st.stop()
     
-    total_leads = len(df_filtered)
-    st.success(f"Successfully loaded **{total_leads:,}** leads from S3.")
+    st.success(f"Successfully loaded **{len(df_filtered):,}** leads from S3.")
 
     # ---------------------- Chat Section ----------------------
     st.write("### 💬 Chat with Sales Buddy")
 
     if "chat" not in st.session_state:
         st.session_state.chat = [
-            {"role": "ai", "content": f"Hello! I have loaded your CRM data containing {total_leads:,} leads. Ask me anything about your leads using the examples below!"}
+            {"role": "ai", "content": "Hello! I have loaded your CRM data. Ask me anything about your leads using the examples below!"}
         ]
 
     # Render chat
@@ -335,36 +287,45 @@ def main():
         st.session_state.chat.append({"role": "user", "content": query})
 
         # Process the query using the loaded data and key
-        # Step 1: Filter data context based on query (returns CSV string and count now)
-        data_ctx, count_sent = filter_data_context(df_filtered, query) 
-        
-        with st.spinner(f"Analyzing {count_sent:,} relevant lead records..."):
+        with st.spinner("Analyzing..."):
+            # Step 1: Filter data context based on query (returns CSV string now)
+            data_ctx = filter_data_context(df_filtered, query)
             
-            # Step 2: Ask Gemini with the data string, API key, and count
-            reply = ask_gemini(query, data_ctx, gemini_api_key, count_sent)
+            # Step 2: Ask Gemini with the data string
+            reply = ask_gemini(query, data_ctx, gemini_api_key)
 
         st.session_state.chat.append({"role": "ai", "content": reply})
         st.rerun()
 
-    # ---------------------- Sample Questions (The "questions training the model part" for the user) ----------------------
+    # ---------------------- Sample Questions ----------------------
     st.divider()
     with st.expander("✨ Click for Sample Questions to Ask Your Sales Buddy", expanded=False):
         
         sample_questions = [
-            "What is the **total Annual Revenue** associated with leads currently in the **'Qualified'** status?",
-            "Show the **distribution of leads** across all lead statuses in a table.",
-            "Which **Lead Owner** has the highest count of **'Negotiation/Review'** leads?",
-            "List the **top 5 companies** by lead count that are *not* marked as 'Disqualified'.",
+            "How many leads are currently in the **'Negotiation/Review'** status?",
+            "What is the **distribution of leads** across all lead statuses?",
+            "Which **lead owner** has the highest number of **'Qualified'** leads?",
+            "Show me a list of all leads that are currently **'Open'** but have an **Annual Revenue greater than 50,000**.",
             
-            "How many leads are in **New York** and what is their **average Annual Revenue**?",
-            "List the **Full Names** and **Companies** of the top 3 high-value leads in **India**.",
-            "Provide a breakdown of **Lead Sources** for leads located in the **State of Texas**.",
-            "Compare the lead status distribution between leads from **'Partner'** and **'Trade Show'** sources.",
+            "How many leads do we have in **Bangalore**?",
+            "What is the average Annual Revenue of leads located in the **State of Texas**?",
+            "Provide a breakdown of lead sources for leads in **New York**.",
+            "List the top 5 companies from **India**.",
 
-            "Who are our **hot convertible leads** (Full Name and Company) based on Annual Revenue?",
-            "What is the **average Annual Revenue** for leads that have a high **potential** for conversion right now?",
-            "What is the current **Lead Status** and **Annual Revenue** for the lead with **Record Id 12345** (use a sample ID from your data)?",
-            "What is the total number of leads owned by **Jane Doe** and what is their combined annual revenue?"
+            "Who are our **best convertible leads** based on Annual Revenue?",
+            "Analyze the **hot leads** and tell me which **Lead Source** is performing the best.",
+            "Give me the **full names** and **companies** of all leads not marked as 'Disqualified' or 'Lost'.",
+            "Which leads have the highest **potential** for conversion right now?",
+            
+            "Which **Lead Source** has generated the most leads?",
+            "What is the **average Annual Revenue** for leads sourced from **'Web Download'**?",
+            "List the **top 10 companies** by lead count.",
+            "Compare the lead status distribution between leads from **'Partner'** and **'Trade Show'** sources.",
+            
+            "What is the current **Lead Status** and **Annual Revenue** for **John Doe** (or a specific Record Id)?",
+            "Who is the **Lead Owner** for the company **Acme Corp**?",
+            "Provide the **Street, City, and Zip Code** for the lead named **Jane Smith**.",
+            "What is the total number of leads owned by **Sarah Connor** and what is their combined annual revenue?"
         ]
 
         # Display the sample questions in two columns
