@@ -11,7 +11,7 @@ import json
 # ---------------------- AWS CONFIG (UPDATED) --------------------------
 # Set these variables to match your AWS setup
 S3_BUCKET_NAME = "zodopt"
-S3_FILE_KEY = "Leads by Status.xlsx"
+S3_FILE_KEY = "Leaddata/Leads by Status.xlsx"
 
 # --- AWS Secrets Manager Configuration ---
 AWS_REGION = "ap-south-1" # <--- UPDATED REGION (Mumbai)
