@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
-# ❌ REMOVED: from google.generativeai.types import Part (This caused the error)
+# ❌ REMOVED: from google.generativeai.types import Part (Still removed to avoid errors)
 import base64
 import mimetypes
 import boto3 
@@ -98,8 +98,12 @@ def load_data_from_s3(bucket_name, file_key, required_cols):
         return None, f"❌ Error reading/processing data: {e}"
 
 
+# ✅ REVERTED: Now returns a CSV string for the prompt
 def filter_data_context(df, query):
-    """Filters the DataFrame based on smart keywords (e.g., location, 'hot leads')."""
+    """
+    Filters the DataFrame based on smart keywords and returns the filtered 
+    data as a tab-separated CSV string for the LLM prompt.
+    """
     df_working = df.copy()
     query_lower = query.lower()
 
@@ -122,50 +126,41 @@ def filter_data_context(df, query):
         if df_working.empty:
             df_working = df.head(0) 
 
-    return df_working 
+    # Return the data as a tab-separated string
+    return df_working.to_csv(index=False, sep="\t")
 
 
-def ask_gemini(question, df_context, api_key):
+# ✅ REVERTED: Now accepts a CSV string and puts it directly in the prompt
+def ask_gemini(question, data_context, api_key):
     """
-    Writes the filtered DataFrame to a temporary CSV file, uploads it as a Part 
-    to the Gemini API, and asks the question. (Optimized for speed)
+    Sends the question and filtered data context (as a string) to the Gemini API.
     """
-    client = None
-    uploaded_file = None
     try:
         genai.configure(api_key=api_key)
-        client = genai.Client() # Use the Client object for file handling
-        
-        # 1. Save DataFrame to a temporary CSV file
-        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp_file:
-            df_context.to_csv(tmp_file.name, index=False)
-            csv_path = tmp_file.name
+        # Assuming you can instantiate GenerativeModel without the Client object
+        model = genai.GenerativeModel(GEMINI_MODEL) 
 
-        # 2. Upload the file to the Gemini API
-        uploaded_file = client.files.upload(file=csv_path)
-        
-        # 3. Create the prompt with the file reference
-        # FIX: Using genai.types.Part since direct import failed
-        prompt = [
-            genai.types.Part.from_text("You are ZODOPT Sales Buddy. Strictly analyze the attached CSV file of CRM lead data."),
-            genai.types.Part.from_text(f"--- QUESTION ---\n{question}\n\nProvide structured bullet-point insights based ONLY on the data."),
-            uploaded_file
-        ]
+        prompt = f"""
+You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
+Do not guess or hallucinate any values outside the dataset.
 
-        # 4. Generate content
-        model = client.models.get(GEMINI_MODEL)
+--- DATASET ---
+{data_context}
+
+--- QUESTION ---
+{question}
+
+Provide structured bullet-point insights, using the data fields provided.
+"""
+
         response = model.generate_content(prompt)
-        
         return response.text
 
     except Exception as e:
+        # Check if the error is the expected one, and if not, show the real error
+        if "has no attribute 'Client'" in str(e):
+            return "❌ Gemini API Configuration Error: The installed SDK version is too old. Please try updating it (`pip install --upgrade google-generativeai`)."
         return f"❌ Gemini API Error: {e}"
-    finally:
-        # 5. Clean up: Delete the temporary local file and the uploaded file part
-        if uploaded_file and client:
-             client.files.delete(name=uploaded_file.name)
-        if 'csv_path' in locals() and os.path.exists(csv_path):
-            os.unlink(csv_path)
 
 
 # ---------------------- BACKGROUND CSS ----------------------
@@ -293,11 +288,11 @@ def main():
 
         # Process the query using the loaded data and key
         with st.spinner("Analyzing..."):
-            # Step 1: Filter data context based on query (returns DataFrame now)
-            df_ctx = filter_data_context(df_filtered, query)
+            # Step 1: Filter data context based on query (returns CSV string now)
+            data_ctx = filter_data_context(df_filtered, query)
             
-            # Step 2: Ask Gemini with the data file
-            reply = ask_gemini(query, df_ctx, gemini_api_key)
+            # Step 2: Ask Gemini with the data string
+            reply = ask_gemini(query, data_ctx, gemini_api_key)
 
         st.session_state.chat.append({"role": "ai", "content": reply})
         st.rerun()
