@@ -1,34 +1,28 @@
-# Sales Buddy
-
 import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
-# ❌ REMOVED: from google.generativeai.types import Part (Still removed to avoid errors)
 import base64
 import mimetypes
-import boto3 
-from botocore.exceptions import ClientError
-from io import BytesIO
-import json
-import tempfile 
+import warnings
 
-# ---------------------- AWS CONFIG --------------------------
-# Set these variables to match your AWS setup
-S3_BUCKET_NAME = "zodopt"
-S3_FILE_KEY = "Leaddata/Leads by Status.xlsx" 
-
-# --- AWS Secrets Manager Configuration ---
-AWS_REGION = "ap-south-1" 
-GEMINI_SECRET_NAME = "salesbuddy/secrets" 
-GEMINI_SECRET_KEY = "GEMINI_API_KEY" 
+# Suppress the openpyxl UserWarning that occurs on loading the Excel file
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl") 
 
 # ---------------------- CONFIG -----------------------------
-GEMINI_MODEL = "gemini-2.5-flash" 
+GEMINI_MODEL = "gemini-2.5-flash"
 
-# Paths for local assets (used only for images/styling)
+# Paths on EC2 (inside your cloned repo)
+SALES_DATA_PATH = "salesbuddy.xlsx"
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
+
+# --- TOKEN-SAVING CONFIGURATION ---
+# To prevent 429 quota errors, limit the dataset size sent to the LLM
+MAX_LEADS_TO_SEND = 150  # Max leads to sample and send for analysis
+# Only send the most essential columns to save tokens.
+CORE_ANALYSIS_COLS = ["Record Id", "Full Name", "Company", "Lead Status", "Annual Revenue", "City"]
+
 
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
@@ -38,81 +32,42 @@ REQUIRED_COLS = [
 
 DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 
-# ---------------------- FUNCTIONS: AWS & DATA LOADING --------------------------
-
-@st.cache_resource
-def get_secret(secret_name, region_name, key_name):
-    """Fetches a specific key's value from a secret stored in AWS Secrets Manager."""
-    try:
-        session = boto3.session.Session()
-        client = session.client(
-            service_name='secretsmanager',
-            region_name=region_name
-        )
-        
-        get_secret_value_response = client.get_secret_value(
-            SecretId=secret_name
-        )
-
-        if 'SecretString' in get_secret_value_response:
-            secret = json.loads(get_secret_value_response['SecretString'])
-            return secret.get(key_name), None
-        else:
-            return None, "❌ Secret is not a JSON string (binary secret not supported for API Key)."
-    
-    except ClientError as e:
-        error_map = {
-            'ResourceNotFoundException': f"Secret **{secret_name}** not found.",
-            'InvalidRequestException': "Invalid request to Secrets Manager.",
-            'InvalidParameterException': "Invalid parameter in Secrets Manager request.",
-        }
-        return None, f"❌ Secrets Manager Error: {error_map.get(e.response['Error']['Code'], str(e))}"
-    except Exception as e:
-        return None, f"❌ Unexpected error in Secrets Manager: {e}"
-
+# ---------------------- FUNCTIONS --------------------------
 
 @st.cache_data(ttl=600)
-def load_data_from_s3(bucket_name, file_key, required_cols):
-    """Downloads an Excel file from S3 and loads it into a Pandas DataFrame."""
+def load_sales_data(file_path, required_cols):
+    """Loads the Excel file into a Pandas DataFrame."""
+    if not os.path.exists(file_path):
+        return None, f"❌ File not found at: **{file_path}**"
     try:
-        s3 = boto3.client('s3')
-        obj = s3.get_object(Bucket=bucket_name, Key=file_key)
-        excel_data = obj['Body'].read()
-        
-        df = pd.read_excel(BytesIO(excel_data))
+        df = pd.read_excel(file_path)
         df.columns = df.columns.str.strip()
 
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            return None, f"❌ Missing essential columns: **{', '.join(missing)}**"
+            return None, f"❌ Missing essential columns: {', '.join(missing)}. Check your file structure."
 
         df_filtered = df[required_cols]
-        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce')
+        # Robustly convert Annual Revenue to numeric, treating errors as 0
+        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce').fillna(0)
         return df_filtered, None
 
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'NoSuchKey':
-            return None, f"❌ S3 File not found: s3://**{bucket_name}/{file_key}**"
-        return None, f"❌ S3 Error: {e}"
     except Exception as e:
-        return None, f"❌ Error reading/processing data: {e}"
+        return None, f"❌ Error reading Excel: {e}"
 
 
-# ✅ REVERTED: Now returns a CSV string for the prompt
 def filter_data_context(df, query):
-    """
-    Filters the DataFrame based on smart keywords and returns the filtered 
-    data as a tab-separated CSV string for the LLM prompt.
-    """
+    """Filters data based on the query, reduces columns, and samples rows to save tokens."""
     df_working = df.copy()
     query_lower = query.lower()
 
-    # Smart lead filtering: Exclude disqualified leads for "best/hot" queries
-    key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility", "high value"]
+    # --- 1. Smart Filtering ---
+    # Trigger filter for 'hot leads' keywords
+    key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility"]
     if any(p in query_lower for p in key_phrases):
         df_working = df_working[~df_working["Lead Status"].isin(DISQUALIFYING_STATUSES)]
 
-    # Location extraction
+    # Filter by location keywords
     locations = ["bangalore", "bengaluru", "delhi", "new york", "london", "texas", "india"]
     loc_match = next((loc for loc in locations if loc in query_lower), None)
 
@@ -123,49 +78,77 @@ def filter_data_context(df, query):
             df_working["Country"].astype(str).str.lower().str.contains(loc_match, na=False)
         )
         df_working = df_working[mask]
-        if df_working.empty:
-            df_working = df.head(0) 
 
-    # Return the data as a tab-separated string
+    if df_working.empty:
+        return df.head(0).to_csv(index=False, sep="\t")
+
+    # --- 2. Token Optimization: Column Reduction ---
+    cols_to_send = [col for col in CORE_ANALYSIS_COLS if col in df_working.columns]
+    df_working = df_working[cols_to_send]
+
+    # --- 3. Token Optimization: Row Sampling (Crucial for 429 errors) ---
+    if len(df_working) > MAX_LEADS_TO_SEND:
+        # Prioritize leads by highest Annual Revenue before sampling
+        df_working = df_working.sort_values(by='Annual Revenue', ascending=False)
+        df_working = df_working.head(MAX_LEADS_TO_SEND)
+
     return df_working.to_csv(index=False, sep="\t")
 
 
-# ✅ REVERTED: Now accepts a CSV string and puts it directly in the prompt
-def ask_gemini(question, data_context, api_key):
-    """
-    Sends the question and filtered data context (as a string) to the Gemini API.
-    """
+def ask_gemini(question, data_context):
+    """Configures the Gemini client and sends the prompt with data context and robust error checks."""
     try:
-        genai.configure(api_key=api_key)
-        # Assuming you can instantiate GenerativeModel without the Client object
-        model = genai.GenerativeModel(GEMINI_MODEL) 
+        # --- SECURITY FIX: Load API key from environment variable ---
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+
+        if not gemini_api_key:
+            return "❌ **API Key Error:** The `GEMINI_API_KEY` environment variable is not set. Please set it securely on your EC2 instance."
+
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
 
         prompt = f"""
 You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
-Do not guess or hallucinate any values outside the dataset.
+The data provided is a filtered or sampled subset of the full database. 
+Your analysis must be limited to the provided subset. Do not guess or hallucinate any values outside the dataset.
 
---- DATASET ---
+--- DATASET (Sampled/Filtered) ---
 {data_context}
 
 --- QUESTION ---
 {question}
 
-Provide structured bullet-point insights, using the data fields provided.
+Provide clear, structured, bullet-point insights based ONLY on the data provided.
 """
-
         response = model.generate_content(prompt)
-        return response.text
+        
+        # --- ENHANCED STABILITY CHECK ---
+        if response.text:
+            return response.text
+        
+        if response.candidates:
+            finish_reason = response.candidates[0].finish_reason.name
+            
+            if finish_reason == "SAFETY":
+                # Handles finish_reason = 2 (SAFETY)
+                safety_ratings = response.candidates[0].safety_ratings
+                reasons = [f"{r.category.name}: {r.probability.name}" for r in safety_ratings]
+                return f"❌ **Analysis Blocked (Finish Reason 2):** The prompt or data violated safety policies. Safety Reasons: {', '.join(reasons)}"
+            
+            if finish_reason != "STOP":
+                 # Handles other non-successful finish reasons (e.g., RECITATION, MAX_TOKENS)
+                 return f"⚠️ **Model Generation Failed:** The model stopped for reason: {finish_reason}. Try rephrasing your question."
+        
+        return "⚠️ **Generation Error:** The model returned an empty response. Please try again or rephrase your question."
 
     except Exception as e:
-        # Check if the error is the expected one, and if not, show the real error
-        if "has no attribute 'Client'" in str(e):
-            return "❌ Gemini API Configuration Error: The installed SDK version is too old. Please try updating it (`pip install --upgrade google-generativeai`)."
-        return f"❌ Gemini API Error: {e}"
+        # Catches API connection errors, 429 errors, and other exceptions.
+        return f"❌ **Gemini API Error:** {e}"
 
 
-# ---------------------- BACKGROUND CSS ----------------------
+# ---------------------- BACKGROUND CSS (No changes) ----------------------
 def set_background(image_path):
-    """Sets the Streamlit app background using CSS."""
+    """Sets the custom background image and chat styling."""
     try:
         if not os.path.exists(image_path):
             return
@@ -197,7 +180,7 @@ def set_background(image_path):
                 padding-right: 4rem;
             }}
 
-            h1, h2, h3, p, label, .stMarkdown, .stSelectbox label, .stButton button {{
+            h1, h2, h3, p, label {{
                 color: #111 !important;
                 text-shadow: 0.5px 0.5px 1px rgba(255,255,255,0.8);
             }}
@@ -221,7 +204,9 @@ def set_background(image_path):
         """, unsafe_allow_html=True)
 
     except Exception as e:
-        st.error(f"Background error: {e}")
+        # Suppress error if image assets are missing
+        pass
+
 
 # ---------------------- STREAMLIT APP ----------------------
 
@@ -229,7 +214,7 @@ def main():
 
     st.set_page_config(
         page_title="ZODOPT Sales Buddy",
-        page_icon=LOGO_IMAGE_PATH,
+        page_icon=LOGO_IMAGE_PATH, 
         layout="wide"
     )
 
@@ -247,30 +232,20 @@ def main():
 
     st.divider()
 
-    # --- 1. Load API Key from Secrets Manager ---
-    with st.spinner("Securing API Key from AWS Secrets Manager..."):
-        gemini_api_key, secret_msg = get_secret(GEMINI_SECRET_NAME, AWS_REGION, GEMINI_SECRET_KEY)
-    
-    if gemini_api_key is None:
-        st.error(secret_msg)
-        st.stop()
-    
-    # --- 2. Load Data from S3 ---
-    with st.spinner(f"Loading sales data from S3 bucket **{S3_BUCKET_NAME}**..."):
-        df_filtered, load_msg = load_data_from_s3(S3_BUCKET_NAME, S3_FILE_KEY, REQUIRED_COLS)
-    
+    # Load data
+    df_filtered, load_msg = load_sales_data(SALES_DATA_PATH, REQUIRED_COLS)
     if df_filtered is None:
         st.error(load_msg)
         st.stop()
-    
-    st.success(f"Successfully loaded **{len(df_filtered):,}** leads from S3.")
 
-    # ---------------------- Chat Section ----------------------
+    # Chat section
     st.write("### 💬 Chat with Sales Buddy")
 
     if "chat" not in st.session_state:
+        # Professional and informative initial message
+        initial_message = f"Welcome! I have successfully loaded **{len(df_filtered)}** CRM leads. How can I assist you with lead analysis today?"
         st.session_state.chat = [
-            {"role": "ai", "content": "Hello! I have loaded your CRM data. Ask me anything about your leads using the examples below!"}
+            {"role": "ai", "content": initial_message}
         ]
 
     # Render chat
@@ -286,53 +261,12 @@ def main():
     if query:
         st.session_state.chat.append({"role": "user", "content": query})
 
-        # Process the query using the loaded data and key
         with st.spinner("Analyzing..."):
-            # Step 1: Filter data context based on query (returns CSV string now)
             data_ctx = filter_data_context(df_filtered, query)
-            
-            # Step 2: Ask Gemini with the data string
-            reply = ask_gemini(query, data_ctx, gemini_api_key)
+            reply = ask_gemini(query, data_ctx)
 
         st.session_state.chat.append({"role": "ai", "content": reply})
         st.rerun()
-
-    # ---------------------- Sample Questions ----------------------
-    st.divider()
-    with st.expander("✨ Click for Sample Questions to Ask Your Sales Buddy", expanded=False):
-        
-        sample_questions = [
-            "How many leads are currently in the **'Negotiation/Review'** status?",
-            "What is the **distribution of leads** across all lead statuses?",
-            "Which **lead owner** has the highest number of **'Qualified'** leads?",
-            "Show me a list of all leads that are currently **'Open'** but have an **Annual Revenue greater than 50,000**.",
-            
-            "How many leads do we have in **Bangalore**?",
-            "What is the average Annual Revenue of leads located in the **State of Texas**?",
-            "Provide a breakdown of lead sources for leads in **New York**.",
-            "List the top 5 companies from **India**.",
-
-            "Who are our **best convertible leads** based on Annual Revenue?",
-            "Analyze the **hot leads** and tell me which **Lead Source** is performing the best.",
-            "Give me the **full names** and **companies** of all leads not marked as 'Disqualified' or 'Lost'.",
-            "Which leads have the highest **potential** for conversion right now?",
-            
-            "Which **Lead Source** has generated the most leads?",
-            "What is the **average Annual Revenue** for leads sourced from **'Web Download'**?",
-            "List the **top 10 companies** by lead count.",
-            "Compare the lead status distribution between leads from **'Partner'** and **'Trade Show'** sources.",
-            
-            "What is the current **Lead Status** and **Annual Revenue** for **John Doe** (or a specific Record Id)?",
-            "Who is the **Lead Owner** for the company **Acme Corp**?",
-            "Provide the **Street, City, and Zip Code** for the lead named **Jane Smith**.",
-            "What is the total number of leads owned by **Sarah Connor** and what is their combined annual revenue?"
-        ]
-
-        # Display the sample questions in two columns
-        cols = st.columns(2)
-        for i, q in enumerate(sample_questions):
-            col_index = i % 2
-            cols[col_index].markdown(f"**-** {q}", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
