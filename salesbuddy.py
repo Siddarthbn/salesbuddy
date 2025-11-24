@@ -4,14 +4,16 @@ import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
-from google.generativeai.types import Part
+# FIX: Ensure this import works. If it fails, your SDK might be very old 
+# or needs an update. This path is standard for newer versions.
+from google.generativeai.types import Part 
 import base64
 import mimetypes
 import boto3 
 from botocore.exceptions import ClientError
 from io import BytesIO
 import json
-import tempfile # Added for temporary file creation
+import tempfile 
 
 # ---------------------- AWS CONFIG --------------------------
 # Set these variables to match your AWS setup
@@ -24,8 +26,6 @@ GEMINI_SECRET_NAME = "salesbuddy/secrets"
 GEMINI_SECRET_KEY = "GEMINI_API_KEY" 
 
 # ---------------------- CONFIG -----------------------------
-# Using gemini-2.5-flash which is fast, but adding the data as a file
-# is the key optimization for large inputs.
 GEMINI_MODEL = "gemini-2.5-flash" 
 
 # Paths for local assets (used only for images/styling)
@@ -41,11 +41,10 @@ REQUIRED_COLS = [
 DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 
 # ---------------------- FUNCTIONS: AWS & DATA LOADING --------------------------
-# (get_secret and load_data_from_s3 remain unchanged as they are already optimized)
 
 @st.cache_resource
 def get_secret(secret_name, region_name, key_name):
-    # (Function implementation remains unchanged)
+    """Fetches a specific key's value from a secret stored in AWS Secrets Manager."""
     try:
         session = boto3.session.Session()
         client = session.client(
@@ -76,7 +75,7 @@ def get_secret(secret_name, region_name, key_name):
 
 @st.cache_data(ttl=600)
 def load_data_from_s3(bucket_name, file_key, required_cols):
-    # (Function implementation remains unchanged)
+    """Downloads an Excel file from S3 and loads it into a Pandas DataFrame."""
     try:
         s3 = boto3.client('s3')
         obj = s3.get_object(Bucket=bucket_name, Key=file_key)
@@ -101,12 +100,8 @@ def load_data_from_s3(bucket_name, file_key, required_cols):
         return None, f"❌ Error reading/processing data: {e}"
 
 
-# --- REFINED: Returns DataFrame instead of a massive CSV string ---
 def filter_data_context(df, query):
-    """
-    Filters the DataFrame based on smart keywords (e.g., location, 'hot leads') 
-    to reduce the data context, and returns the filtered DataFrame.
-    """
+    """Filters the DataFrame based on smart keywords (e.g., location, 'hot leads')."""
     df_working = df.copy()
     query_lower = query.lower()
 
@@ -129,21 +124,19 @@ def filter_data_context(df, query):
         if df_working.empty:
             df_working = df.head(0) 
 
-    # Return the DataFrame itself
     return df_working 
 
 
-# --- REFINED: Uploads CSV as a File Part for faster analysis ---
 def ask_gemini(question, df_context, api_key):
     """
     Writes the filtered DataFrame to a temporary CSV file, uploads it as a Part 
-    to the Gemini API, and asks the question.
+    to the Gemini API, and asks the question. (Optimized for speed)
     """
     client = None
     uploaded_file = None
     try:
         genai.configure(api_key=api_key)
-        client = genai.Client()
+        client = genai.Client() # Use the Client object for file handling
         
         # 1. Save DataFrame to a temporary CSV file
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp_file:
@@ -178,7 +171,7 @@ def ask_gemini(question, df_context, api_key):
 
 # ---------------------- BACKGROUND CSS ----------------------
 def set_background(image_path):
-    # (Function implementation remains unchanged)
+    """Sets the Streamlit app background using CSS."""
     try:
         if not os.path.exists(image_path):
             return
@@ -315,31 +308,26 @@ def main():
     with st.expander("✨ Click for Sample Questions to Ask Your Sales Buddy", expanded=False):
         
         sample_questions = [
-            # Lead Status and Pipeline Analysis (4)
             "How many leads are currently in the **'Negotiation/Review'** status?",
             "What is the **distribution of leads** across all lead statuses?",
             "Which **lead owner** has the highest number of **'Qualified'** leads?",
             "Show me a list of all leads that are currently **'Open'** but have an **Annual Revenue greater than 50,000**.",
             
-            # Geographical and Locational Insights (4)
             "How many leads do we have in **Bangalore**?",
             "What is the average Annual Revenue of leads located in the **State of Texas**?",
             "Provide a breakdown of lead sources for leads in **New York**.",
             "List the top 5 companies from **India**.",
 
-            # High-Value & Hot Lead Identification (4)
             "Who are our **best convertible leads** based on Annual Revenue?",
             "Analyze the **hot leads** and tell me which **Lead Source** is performing the best.",
             "Give me the **full names** and **companies** of all leads not marked as 'Disqualified' or 'Lost'.",
             "Which leads have the highest **potential** for conversion right now?",
             
-            # Source and Company Analysis (4)
             "Which **Lead Source** has generated the most leads?",
             "What is the **average Annual Revenue** for leads sourced from **'Web Download'**?",
             "List the **top 10 companies** by lead count.",
             "Compare the lead status distribution between leads from **'Partner'** and **'Trade Show'** sources.",
             
-            # Individual Lead Detail Lookups (4)
             "What is the current **Lead Status** and **Annual Revenue** for **John Doe** (or a specific Record Id)?",
             "Who is the **Lead Owner** for the company **Acme Corp**?",
             "Provide the **Street, City, and Zip Code** for the lead named **Jane Smith**.",
