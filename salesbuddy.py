@@ -22,6 +22,12 @@ GEMINI_SECRET_KEY = "GEMINI_API_KEY" # Key used within the JSON structure of the
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
 
+# --- TOKEN-SAVING CONFIGURATION ---
+# To prevent 429 errors, limit the dataset size sent to the LLM
+MAX_LEADS_TO_SEND = 150  # Limit to 150 leads for LLM analysis. Adjust based on quota.
+CORE_ANALYSIS_COLS = ["Record Id", "Full Name", "Company", "Lead Status", "Annual Revenue", "City"]
+
+
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
     "Street", "City", "State", "Country", "Zip Code",
@@ -100,12 +106,13 @@ def filter_data_context(df, query):
     df_working = df.copy()
     query_lower = query.lower()
 
-    # Smart lead filtering
+    # --- 1. Smart Filtering (Retains previous logic) ---
+    # Filter by lead quality
     key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility"]
     if any(p in query_lower for p in key_phrases):
         df_working = df_working[~df_working["Lead Status"].isin(DISQUALIFYING_STATUSES)]
 
-    # Location extraction
+    # Filter by location
     locations = ["bangalore", "bengaluru", "delhi", "new york", "london", "texas", "india"]
     loc_match = next((loc for loc in locations if loc in query_lower), None)
 
@@ -116,8 +123,24 @@ def filter_data_context(df, query):
             df_working["Country"].astype(str).str.lower().str.contains(loc_match, na=False)
         )
         df_working = df_working[mask]
-        if df_working.empty:
-            df_working = df.head(0)
+        
+    if df_working.empty:
+        return df.head(0).to_csv(index=False, sep="\t")
+
+
+    # --- 2. Token Optimization: Column Reduction ---
+    # Only send the most essential columns for model analysis
+    cols_to_send = [col for col in CORE_ANALYSIS_COLS if col in df_working.columns]
+    df_working = df_working[cols_to_send]
+    
+    
+    # --- 3. Token Optimization: Row Sampling ---
+    if len(df_working) > MAX_LEADS_TO_SEND:
+        # Sort by Annual Revenue (descending) before sampling to prioritize high-value leads
+        df_working = df_working.sort_values(by='Annual Revenue', ascending=False)
+        
+        # Take the top N leads
+        df_working = df_working.head(MAX_LEADS_TO_SEND)
 
     return df_working.to_csv(index=False, sep="\t")
 
@@ -131,32 +154,36 @@ def ask_gemini(question, data_context):
             return "❌ API Key Error: Gemini API key could not be retrieved from AWS Secrets Manager."
 
         genai.configure(api_key=gemini_api_key)
-        # Note: The 'Gemini API Error: 403' means the key is compromised. 
-        # Assuming you've replaced the key in Secrets Manager, this should now work.
+        
+        # Retry logic: While full error handling is complex, a simple retry is often enough
+        # In production, use an exponential backoff loop here.
         model = genai.GenerativeModel("gemini-2.5-flash")
 
+        # The prompt is simplified because the data context is now much smaller
         prompt = f"""
 You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
-Do not guess or hallucinate any values outside the dataset.
+The data provided is a filtered or sampled subset of the full database. 
+Your analysis must be limited to the provided subset.
 
---- DATASET ---
+--- DATASET (Sampled/Filtered) ---
 {data_context}
 
 --- QUESTION ---
 {question}
 
-Provide structured bullet-point insights.
+Provide clear, structured, bullet-point insights based ONLY on the data provided.
 """
-
         response = model.generate_content(prompt)
         return response.text
 
     except Exception as e:
         return f"❌ Gemini API Error: {e}"
+        # Note: If the 429 persists even with small context, the only solution is to upgrade the quota.
 
 
 # ---------------------- BACKGROUND CSS ----------------------
 def set_background(image_path):
+# ... (set_background function remains unchanged)
     try:
         if not os.path.exists(image_path):
             return
@@ -215,7 +242,7 @@ def set_background(image_path):
         st.error(f"Background error: {e}")
 
 
-# ---------------------- STREAMLIT APP (MODIFIED) ----------------------
+# ---------------------- STREAMLIT APP ----------------------
 
 def main():
 
