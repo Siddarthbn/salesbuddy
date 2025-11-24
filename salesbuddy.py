@@ -1,14 +1,17 @@
+# Sales Buddy
+
 import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
 import base64
 import mimetypes
-import boto3
-import io
+import boto3 # AWS SDK
+from botocore.exceptions import ClientError
+from io import BytesIO
 import json
 
-# ---------------------- AWS CONFIG (UPDATED) --------------------------
+# ---------------------- AWS CONFIG --------------------------
 # Set these variables to match your AWS setup
 S3_BUCKET_NAME = "zodopt"
 S3_FILE_KEY = "Leaddata/Leads by Status.xlsx" # Corrected S3 path
@@ -18,16 +21,12 @@ AWS_REGION = "ap-south-1" # Mumbai region
 GEMINI_SECRET_NAME = "salesbuddy/secrets" # Corrected Secret path
 GEMINI_SECRET_KEY = "GEMINI_API_KEY" # Key used within the JSON structure of the secret
 
+# ---------------------- CONFIG -----------------------------
+GEMINI_MODEL = "gemini-2.5-flash"
+
 # Paths for local assets (used only for images/styling)
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
-
-# --- TOKEN-SAVING CONFIGURATION ---
-# To prevent 429 quota errors, limit the dataset size sent to the LLM
-MAX_LEADS_TO_SEND = 150  # Limit to 150 leads for LLM analysis. Adjust based on quota.
-# Only send the most essential columns to save tokens.
-CORE_ANALYSIS_COLS = ["Record Id", "Full Name", "Company", "Lead Status", "Annual Revenue", "City"]
-
 
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
@@ -37,79 +36,87 @@ REQUIRED_COLS = [
 
 DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 
-# ---------------------- SECRETS MANAGER FUNCTION --------------------------
+# ---------------------- FUNCTIONS: AWS & DATA LOADING --------------------------
 
 @st.cache_resource
-def get_secret_value(secret_name, secret_key, region_name):
+def get_secret(secret_name, region_name, key_name):
     """
-    Retrieves the secret from AWS Secrets Manager using the specified region.
+    Fetches a specific key's value from a secret stored in AWS Secrets Manager.
     """
     try:
-        client = boto3.client(
+        session = boto3.session.Session()
+        client = session.client(
             service_name='secretsmanager',
             region_name=region_name
         )
-
+        
         get_secret_value_response = client.get_secret_value(
             SecretId=secret_name
         )
+
+        if 'SecretString' in get_secret_value_response:
+            secret = json.loads(get_secret_value_response['SecretString'])
+            return secret.get(key_name), None
+        else:
+            return None, "❌ Secret is not a JSON string (binary secret not supported for API Key)."
+    
+    except ClientError as e:
+        error_map = {
+            'ResourceNotFoundException': f"Secret **{secret_name}** not found.",
+            'InvalidRequestException': "Invalid request to Secrets Manager.",
+            'InvalidParameterException': "Invalid parameter in Secrets Manager request.",
+        }
+        return None, f"❌ Secrets Manager Error: {error_map.get(e.response['Error']['Code'], str(e))}"
     except Exception as e:
-        st.error(f"❌ Secrets Manager Error: Failed to retrieve secret '{secret_name}' in region **{region_name}**. Ensure the IAM Role has 'secretsmanager:GetSecretValue' permission. Details: {e}")
-        st.stop()
-        return None
+        return None, f"❌ Unexpected error in Secrets Manager: {e}"
 
-    if 'SecretString' in get_secret_value_response:
-        secret = get_secret_value_response['SecretString']
-
-        # Parse the JSON string to get the specific key's value
-        try:
-            secret_dict = json.loads(secret)
-            if secret_key in secret_dict:
-                return secret_dict[secret_key]
-            else:
-                st.error(f"❌ Secrets Manager Error: Key '{secret_key}' not found in the secret JSON for '{secret_name}'.")
-                st.stop()
-        except json.JSONDecodeError:
-            st.error(f"❌ Secrets Manager Error: Secret string for '{secret_name}' is not valid JSON.")
-            st.stop()
-    return None
-
-# ---------------------- FUNCTIONS --------------------------
 
 @st.cache_data(ttl=600)
-def load_sales_data_from_s3(bucket_name, file_key, required_cols):
-    """Loads the Excel file directly from S3 into a Pandas DataFrame."""
+def load_data_from_s3(bucket_name, file_key, required_cols):
+    """
+    Downloads an Excel file from S3 and loads it into a Pandas DataFrame.
+    """
     try:
-        s3 = boto3.client('s3', region_name=AWS_REGION)
-
-        response = s3.get_object(Bucket=bucket_name, Key=file_key)
-        excel_data = response['Body'].read()
-        df = pd.read_excel(io.BytesIO(excel_data))
-
+        s3 = boto3.client('s3')
+        # Download the file object from S3
+        obj = s3.get_object(Bucket=bucket_name, Key=file_key)
+        excel_data = obj['Body'].read()
+        
+        # Read the Excel data directly into a DataFrame from memory
+        df = pd.read_excel(BytesIO(excel_data))
         df.columns = df.columns.str.strip()
 
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            return None, f"❌ Missing essential columns: {', '.join(missing)}. Check your file structure."
+            return None, f"❌ Missing essential columns: **{', '.join(missing)}**"
 
         df_filtered = df[required_cols]
-        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce').fillna(0)
-
+        # Use errors='coerce' to turn non-numeric values into NaN for safety
+        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce')
         return df_filtered, None
 
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return None, f"❌ S3 File not found: s3://**{bucket_name}/{file_key}**"
+        return None, f"❌ S3 Error: {e}"
     except Exception as e:
-        return None, f"❌ S3/Boto3 Error: Failed to load data from s3://{bucket_name}/{file_key} in **{AWS_REGION}**. Details: {e}"
+        return None, f"❌ Error reading/processing data: {e}"
 
 
 def filter_data_context(df, query):
+    """
+    Filters the DataFrame based on smart keywords (e.g., location, 'hot leads') 
+    to reduce the data context sent to the LLM.
+    """
     df_working = df.copy()
     query_lower = query.lower()
 
-    # --- 1. Smart Filtering ---
-    key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility"]
+    # Smart lead filtering: Exclude disqualified leads for "best/hot" queries
+    key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility", "high value"]
     if any(p in query_lower for p in key_phrases):
         df_working = df_working[~df_working["Lead Status"].isin(DISQUALIFYING_STATUSES)]
 
+    # Location extraction
     locations = ["bangalore", "bengaluru", "delhi", "new york", "london", "texas", "india"]
     loc_match = next((loc for loc in locations if loc in query_lower), None)
 
@@ -120,78 +127,45 @@ def filter_data_context(df, query):
             df_working["Country"].astype(str).str.lower().str.contains(loc_match, na=False)
         )
         df_working = df_working[mask]
-        
-    if df_working.empty:
-        return df.head(0).to_csv(index=False, sep="\t")
-
-
-    # --- 2. Token Optimization: Column Reduction ---
-    cols_to_send = [col for col in CORE_ANALYSIS_COLS if col in df_working.columns]
-    df_working = df_working[cols_to_send]
-    
-    
-    # --- 3. Token Optimization: Row Sampling ---
-    if len(df_working) > MAX_LEADS_TO_SEND:
-        # Prioritize high-value leads by sorting before sampling
-        df_working = df_working.sort_values(by='Annual Revenue', ascending=False)
-        df_working = df_working.head(MAX_LEADS_TO_SEND)
+        if df_working.empty:
+            # Important: return empty df with columns to maintain structure
+            df_working = df.head(0) 
 
     return df_working.to_csv(index=False, sep="\t")
 
 
-def ask_gemini(question, data_context):
+def ask_gemini(question, data_context, api_key):
+    """
+    Sends the question and filtered data context to the Gemini API.
+    """
     try:
-        # Fetch the key securely
-        gemini_api_key = get_secret_value(GEMINI_SECRET_NAME, GEMINI_SECRET_KEY, AWS_REGION)
-
-        if not gemini_api_key:
-            return "❌ API Key Error: Gemini API key could not be retrieved from AWS Secrets Manager."
-
-        genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        # Configure API key for the current session/request
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
 
         prompt = f"""
 You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
-The data provided is a filtered or sampled subset of the full database. 
-Your analysis must be limited to the provided subset.
+Do not guess or hallucinate any values outside the dataset.
 
---- DATASET (Sampled/Filtered) ---
+--- DATASET ---
 {data_context}
 
 --- QUESTION ---
 {question}
 
-Provide clear, structured, bullet-point insights based ONLY on the data provided.
+Provide structured bullet-point insights, using the data fields provided.
 """
-        
+
         response = model.generate_content(prompt)
-        
-        # --- ENHANCED RESPONSE CHECK ---
-        if response.text:
-            return response.text
-        
-        # Handle cases where the model generates a response object but no text (e.g., safety block)
-        if response.candidates:
-            finish_reason = response.candidates[0].finish_reason.name
-            
-            if finish_reason == "SAFETY":
-                safety_ratings = response.candidates[0].safety_ratings
-                reasons = [f"{r.category.name}: {r.probability.name}" for r in safety_ratings]
-                return f"❌ Analysis Blocked: The model failed to generate a response due to safety policies. Safety Reasons: {', '.join(reasons)}"
-            
-            if finish_reason != "STOP":
-                 return f"⚠️ Model Generation Failed: The model stopped for reason: {finish_reason}. Try rephrasing your question."
-        
-        # Fallback for unknown empty response
-        return "⚠️ Generation Error: The model returned an empty response. Please try again or rephrase your question."
+        return response.text
 
     except Exception as e:
-        # Catches API key errors, connection issues, or unhandled 429s/403s.
         return f"❌ Gemini API Error: {e}"
 
 
 # ---------------------- BACKGROUND CSS ----------------------
 def set_background(image_path):
+    # (Function remains the same for background styling)
     try:
         if not os.path.exists(image_path):
             return
@@ -223,7 +197,7 @@ def set_background(image_path):
                 padding-right: 4rem;
             }}
 
-            h1, h2, h3, p, label {{
+            h1, h2, h3, p, label, .stMarkdown, .stSelectbox label, .stButton button {{
                 color: #111 !important;
                 text-shadow: 0.5px 0.5px 1px rgba(255,255,255,0.8);
             }}
@@ -249,7 +223,6 @@ def set_background(image_path):
     except Exception as e:
         st.error(f"Background error: {e}")
 
-
 # ---------------------- STREAMLIT APP ----------------------
 
 def main():
@@ -274,21 +247,30 @@ def main():
 
     st.divider()
 
-    # Load data from S3
-    df_filtered, load_msg = load_sales_data_from_s3(S3_BUCKET_NAME, S3_FILE_KEY, REQUIRED_COLS)
+    # --- 1. Load API Key from Secrets Manager ---
+    with st.spinner("Securing API Key from AWS Secrets Manager..."):
+        gemini_api_key, secret_msg = get_secret(GEMINI_SECRET_NAME, AWS_REGION, GEMINI_SECRET_KEY)
+    
+    if gemini_api_key is None:
+        st.error(secret_msg)
+        st.stop()
+    
+    # --- 2. Load Data from S3 ---
+    with st.spinner(f"Loading sales data from S3 bucket **{S3_BUCKET_NAME}**..."):
+        df_filtered, load_msg = load_data_from_s3(S3_BUCKET_NAME, S3_FILE_KEY, REQUIRED_COLS)
+    
     if df_filtered is None:
         st.error(load_msg)
         st.stop()
+    
+    st.success(f"Successfully loaded **{len(df_filtered):,}** leads from S3.")
 
-    # Chat section
+    # ---------------------- Chat Section ----------------------
     st.write("### 💬 Chat with Sales Buddy")
 
     if "chat" not in st.session_state:
-        # Refined professional initial message
-        initial_message = f"Welcome! I have successfully loaded **{len(df_filtered)}** CRM leads. How can I assist you with lead analysis today?"
-        
         st.session_state.chat = [
-            {"role": "ai", "content": initial_message}
+            {"role": "ai", "content": "Hello! I have loaded your CRM data. Ask me anything about your leads using the examples below!"}
         ]
 
     # Render chat
@@ -304,12 +286,58 @@ def main():
     if query:
         st.session_state.chat.append({"role": "user", "content": query})
 
+        # Process the query using the loaded data and key
         with st.spinner("Analyzing..."):
+            # Step 1: Filter data context based on query
             data_ctx = filter_data_context(df_filtered, query)
-            reply = ask_gemini(query, data_ctx)
+            
+            # Step 2: Ask Gemini with the context
+            reply = ask_gemini(query, data_ctx, gemini_api_key)
 
         st.session_state.chat.append({"role": "ai", "content": reply})
         st.rerun()
+
+    # ---------------------- Sample Questions ----------------------
+    st.divider()
+    with st.expander("✨ Click for Sample Questions to Ask Your Sales Buddy", expanded=False):
+        
+        sample_questions = [
+            # Lead Status and Pipeline Analysis (4)
+            "How many leads are currently in the **'Negotiation/Review'** status?",
+            "What is the **distribution of leads** across all lead statuses?",
+            "Which **lead owner** has the highest number of **'Qualified'** leads?",
+            "Show me a list of all leads that are currently **'Open'** but have an **Annual Revenue greater than 50,000**.",
+            
+            # Geographical and Locational Insights (4)
+            "How many leads do we have in **Bangalore**?",
+            "What is the average Annual Revenue of leads located in the **State of Texas**?",
+            "Provide a breakdown of lead sources for leads in **New York**.",
+            "List the top 5 companies from **India**.",
+
+            # High-Value & Hot Lead Identification (4)
+            "Who are our **best convertible leads** based on Annual Revenue?",
+            "Analyze the **hot leads** and tell me which **Lead Source** is performing the best.",
+            "Give me the **full names** and **companies** of all leads not marked as 'Disqualified' or 'Lost'.",
+            "Which leads have the highest **potential** for conversion right now?",
+            
+            # Source and Company Analysis (4)
+            "Which **Lead Source** has generated the most leads?",
+            "What is the **average Annual Revenue** for leads sourced from **'Web Download'**?",
+            "List the **top 10 companies** by lead count.",
+            "Compare the lead status distribution between leads from **'Partner'** and **'Trade Show'** sources.",
+            
+            # Individual Lead Detail Lookups (4)
+            "What is the current **Lead Status** and **Annual Revenue** for **John Doe** (or a specific Record Id)?",
+            "Who is the **Lead Owner** for the company **Acme Corp**?",
+            "Provide the **Street, City, and Zip Code** for the lead named **Jane Smith**.",
+            "What is the total number of leads owned by **Sarah Connor** and what is their combined annual revenue?"
+        ]
+
+        # Display the sample questions in two columns
+        cols = st.columns(2)
+        for i, q in enumerate(sample_questions):
+            col_index = i % 2
+            cols[col_index].markdown(f"**-** {q}", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
