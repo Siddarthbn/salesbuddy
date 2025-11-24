@@ -4,25 +4,29 @@ import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
+from google.generativeai.types import Part
 import base64
 import mimetypes
-import boto3 # AWS SDK
+import boto3 
 from botocore.exceptions import ClientError
 from io import BytesIO
 import json
+import tempfile # Added for temporary file creation
 
 # ---------------------- AWS CONFIG --------------------------
 # Set these variables to match your AWS setup
 S3_BUCKET_NAME = "zodopt"
-S3_FILE_KEY = "Leaddata/Leads by Status.xlsx" # Corrected S3 path
+S3_FILE_KEY = "Leaddata/Leads by Status.xlsx" 
 
 # --- AWS Secrets Manager Configuration ---
-AWS_REGION = "ap-south-1" # Mumbai region
-GEMINI_SECRET_NAME = "salesbuddy/secrets" # Corrected Secret path
-GEMINI_SECRET_KEY = "GEMINI_API_KEY" # Key used within the JSON structure of the secret
+AWS_REGION = "ap-south-1" 
+GEMINI_SECRET_NAME = "salesbuddy/secrets" 
+GEMINI_SECRET_KEY = "GEMINI_API_KEY" 
 
 # ---------------------- CONFIG -----------------------------
-GEMINI_MODEL = "gemini-2.5-flash"
+# Using gemini-2.5-flash which is fast, but adding the data as a file
+# is the key optimization for large inputs.
+GEMINI_MODEL = "gemini-2.5-flash" 
 
 # Paths for local assets (used only for images/styling)
 BACKGROUND_IMAGE_PATH = "background.jpg"
@@ -37,12 +41,11 @@ REQUIRED_COLS = [
 DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 
 # ---------------------- FUNCTIONS: AWS & DATA LOADING --------------------------
+# (get_secret and load_data_from_s3 remain unchanged as they are already optimized)
 
 @st.cache_resource
 def get_secret(secret_name, region_name, key_name):
-    """
-    Fetches a specific key's value from a secret stored in AWS Secrets Manager.
-    """
+    # (Function implementation remains unchanged)
     try:
         session = boto3.session.Session()
         client = session.client(
@@ -73,16 +76,12 @@ def get_secret(secret_name, region_name, key_name):
 
 @st.cache_data(ttl=600)
 def load_data_from_s3(bucket_name, file_key, required_cols):
-    """
-    Downloads an Excel file from S3 and loads it into a Pandas DataFrame.
-    """
+    # (Function implementation remains unchanged)
     try:
         s3 = boto3.client('s3')
-        # Download the file object from S3
         obj = s3.get_object(Bucket=bucket_name, Key=file_key)
         excel_data = obj['Body'].read()
         
-        # Read the Excel data directly into a DataFrame from memory
         df = pd.read_excel(BytesIO(excel_data))
         df.columns = df.columns.str.strip()
 
@@ -91,7 +90,6 @@ def load_data_from_s3(bucket_name, file_key, required_cols):
             return None, f"❌ Missing essential columns: **{', '.join(missing)}**"
 
         df_filtered = df[required_cols]
-        # Use errors='coerce' to turn non-numeric values into NaN for safety
         df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce')
         return df_filtered, None
 
@@ -103,10 +101,11 @@ def load_data_from_s3(bucket_name, file_key, required_cols):
         return None, f"❌ Error reading/processing data: {e}"
 
 
+# --- REFINED: Returns DataFrame instead of a massive CSV string ---
 def filter_data_context(df, query):
     """
     Filters the DataFrame based on smart keywords (e.g., location, 'hot leads') 
-    to reduce the data context sent to the LLM.
+    to reduce the data context, and returns the filtered DataFrame.
     """
     df_working = df.copy()
     query_lower = query.lower()
@@ -128,44 +127,58 @@ def filter_data_context(df, query):
         )
         df_working = df_working[mask]
         if df_working.empty:
-            # Important: return empty df with columns to maintain structure
             df_working = df.head(0) 
 
-    return df_working.to_csv(index=False, sep="\t")
+    # Return the DataFrame itself
+    return df_working 
 
 
-def ask_gemini(question, data_context, api_key):
+# --- REFINED: Uploads CSV as a File Part for faster analysis ---
+def ask_gemini(question, df_context, api_key):
     """
-    Sends the question and filtered data context to the Gemini API.
+    Writes the filtered DataFrame to a temporary CSV file, uploads it as a Part 
+    to the Gemini API, and asks the question.
     """
+    client = None
+    uploaded_file = None
     try:
-        # Configure API key for the current session/request
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        client = genai.Client()
+        
+        # 1. Save DataFrame to a temporary CSV file
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp_file:
+            df_context.to_csv(tmp_file.name, index=False)
+            csv_path = tmp_file.name
 
-        prompt = f"""
-You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
-Do not guess or hallucinate any values outside the dataset.
+        # 2. Upload the file to the Gemini API
+        uploaded_file = client.files.upload(file=csv_path)
+        
+        # 3. Create the prompt with the file reference
+        prompt = [
+            Part.from_text("You are ZODOPT Sales Buddy. Strictly analyze the attached CSV file of CRM lead data."),
+            Part.from_text(f"--- QUESTION ---\n{question}\n\nProvide structured bullet-point insights based ONLY on the data."),
+            uploaded_file
+        ]
 
---- DATASET ---
-{data_context}
-
---- QUESTION ---
-{question}
-
-Provide structured bullet-point insights, using the data fields provided.
-"""
-
+        # 4. Generate content
+        model = client.models.get(GEMINI_MODEL)
         response = model.generate_content(prompt)
+        
         return response.text
 
     except Exception as e:
         return f"❌ Gemini API Error: {e}"
+    finally:
+        # 5. Clean up: Delete the temporary local file and the uploaded file part
+        if uploaded_file and client:
+             client.files.delete(name=uploaded_file.name)
+        if 'csv_path' in locals() and os.path.exists(csv_path):
+            os.unlink(csv_path)
 
 
 # ---------------------- BACKGROUND CSS ----------------------
 def set_background(image_path):
-    # (Function remains the same for background styling)
+    # (Function implementation remains unchanged)
     try:
         if not os.path.exists(image_path):
             return
@@ -288,11 +301,11 @@ def main():
 
         # Process the query using the loaded data and key
         with st.spinner("Analyzing..."):
-            # Step 1: Filter data context based on query
-            data_ctx = filter_data_context(df_filtered, query)
+            # Step 1: Filter data context based on query (returns DataFrame now)
+            df_ctx = filter_data_context(df_filtered, query)
             
-            # Step 2: Ask Gemini with the context
-            reply = ask_gemini(query, data_ctx, gemini_api_key)
+            # Step 2: Ask Gemini with the data file
+            reply = ask_gemini(query, df_ctx, gemini_api_key)
 
         st.session_state.chat.append({"role": "ai", "content": reply})
         st.rerun()
