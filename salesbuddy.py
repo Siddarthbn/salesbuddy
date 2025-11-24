@@ -7,20 +7,19 @@ import mimetypes
 import warnings
 
 # Suppress the openpyxl UserWarning that occurs on loading the Excel file
-# This warning is common when reading files and doesn't affect functionality.
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl") 
 
-# ---------------------- CONFIGURATION -----------------------------
+# ---------------------- CONFIG -----------------------------
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Paths on EC2 (assuming these assets exist in the same directory)
+# Paths on EC2 (inside your cloned repo)
 SALES_DATA_PATH = "salesbuddy.xlsx"
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
 
 # --- TOKEN-SAVING CONFIGURATION ---
-# Max leads to sample and send for analysis to prevent quota errors and save tokens
-MAX_LEADS_TO_SEND = 150 
+# To prevent 429 quota errors, limit the dataset size sent to the LLM
+MAX_LEADS_TO_SEND = 150  # Max leads to sample and send for analysis
 # Only send the most essential columns to save tokens.
 CORE_ANALYSIS_COLS = ["Record Id", "Full Name", "Company", "Lead Status", "Annual Revenue", "City"]
 
@@ -33,16 +32,15 @@ REQUIRED_COLS = [
 
 DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 
-# ---------------------- DATA LOADING & PREPROCESSING --------------------------
+# ---------------------- FUNCTIONS --------------------------
 
 @st.cache_data(ttl=600)
 def load_sales_data(file_path, required_cols):
-    """Loads the Excel file into a Pandas DataFrame with validation and cleaning."""
+    """Loads the Excel file into a Pandas DataFrame."""
     if not os.path.exists(file_path):
         return None, f"❌ File not found at: **{file_path}**"
     try:
         df = pd.read_excel(file_path)
-        # Clean column names by stripping whitespace
         df.columns = df.columns.str.strip()
 
         missing = [c for c in required_cols if c not in df.columns]
@@ -51,10 +49,7 @@ def load_sales_data(file_path, required_cols):
 
         df_filtered = df[required_cols]
         # Robustly convert Annual Revenue to numeric, treating errors as 0
-        df_filtered['Annual Revenue'] = pd.to_numeric(
-            df_filtered['Annual Revenue'], errors='coerce'
-        ).fillna(0)
-        
+        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce').fillna(0)
         return df_filtered, None
 
     except Exception as e:
@@ -62,21 +57,17 @@ def load_sales_data(file_path, required_cols):
 
 
 def filter_data_context(df, query):
-    """
-    Filters data based on the query, reduces columns, and samples rows to save tokens.
-    Returns the filtered and sampled data as a tab-separated string,
-    along with the count of rows sent to the model.
-    """
+    """Filters data based on the query, reduces columns, and samples rows to save tokens."""
     df_working = df.copy()
     query_lower = query.lower()
 
-    # --- 1. Smart Filtering based on Query Keywords ---
+    # --- 1. Smart Filtering ---
     # Trigger filter for 'hot leads' keywords
-    key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility", "high value"]
+    key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility"]
     if any(p in query_lower for p in key_phrases):
         df_working = df_working[~df_working["Lead Status"].isin(DISQUALIFYING_STATUSES)]
 
-    # Filter by location keywords (a simple, non-exhaustive list)
+    # Filter by location keywords
     locations = ["bangalore", "bengaluru", "delhi", "new york", "london", "texas", "india"]
     loc_match = next((loc for loc in locations if loc in query_lower), None)
 
@@ -88,47 +79,37 @@ def filter_data_context(df, query):
         )
         df_working = df_working[mask]
 
-    # If filtering results in empty data, send a small placeholder
     if df_working.empty:
-        return df.head(0).to_csv(index=False, sep="\t"), 0
+        return df.head(0).to_csv(index=False, sep="\t")
 
     # --- 2. Token Optimization: Column Reduction ---
     cols_to_send = [col for col in CORE_ANALYSIS_COLS if col in df_working.columns]
     df_working = df_working[cols_to_send]
 
-    # --- 3. Token Optimization: Row Sampling (Crucial) ---
-    original_lead_count = len(df_working)
-
-    if original_lead_count > MAX_LEADS_TO_SEND:
+    # --- 3. Token Optimization: Row Sampling (Crucial for 429 errors) ---
+    if len(df_working) > MAX_LEADS_TO_SEND:
         # Prioritize leads by highest Annual Revenue before sampling
         df_working = df_working.sort_values(by='Annual Revenue', ascending=False)
         df_working = df_working.head(MAX_LEADS_TO_SEND)
-    
-    count_sent = len(df_working)
-    
-    return df_working.to_csv(index=False, sep="\t"), count_sent
+
+    return df_working.to_csv(index=False, sep="\t")
 
 
-# ---------------------- GEMINI INTERACTION --------------------------
-
-def ask_gemini(question, data_context, count_sent):
-    """
-    Configures the Gemini client and sends the prompt with data context.
-    Includes robust error checks for API key and safety responses.
-    """
+def ask_gemini(question, data_context):
+    """Configures the Gemini client and sends the prompt with data context and robust error checks."""
     try:
-        # Load API key from environment variable
+        # --- SECURITY FIX: Load API key from environment variable ---
         gemini_api_key = os.environ.get("GEMINI_API_KEY")
 
         if not gemini_api_key:
-            return "❌ **API Key Error:** The `GEMINI_API_KEY` environment variable is not set. Please set it securely."
+            return "❌ **API Key Error:** The `GEMINI_API_KEY` environment variable is not set. Please set it securely on your EC2 instance."
 
         genai.configure(api_key=gemini_api_key)
         model = genai.GenerativeModel(GEMINI_MODEL)
 
         prompt = f"""
-You are ZODOPT Sales Buddy. Your purpose is to provide clear, actionable insights by strictly analyzing ONLY the following tab-separated CRM lead data.
-The data provided is a filtered or sampled subset of the full database, containing {count_sent} records.
+You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
+The data provided is a filtered or sampled subset of the full database. 
 Your analysis must be limited to the provided subset. Do not guess or hallucinate any values outside the dataset.
 
 --- DATASET (Sampled/Filtered) ---
@@ -156,18 +137,18 @@ Provide clear, structured, bullet-point insights based ONLY on the data provided
             
             if finish_reason != "STOP":
                  # Handles other non-successful finish reasons (e.g., RECITATION, MAX_TOKENS)
-                 return f"⚠️ **Model Generation Failed:** The model stopped for reason: {finish_reason}. Try rephrasing your question or reducing complexity."
+                 return f"⚠️ **Model Generation Failed:** The model stopped for reason: {finish_reason}. Try rephrasing your question."
         
         return "⚠️ **Generation Error:** The model returned an empty response. Please try again or rephrase your question."
 
     except Exception as e:
         # Catches API connection errors, 429 errors, and other exceptions.
-        return f"❌ **Gemini API Error:** An exception occurred during the API call: {e}"
+        return f"❌ **Gemini API Error:** {e}"
 
 
-# ---------------------- STYLING AND UI FUNCTIONS ----------------------
+# ---------------------- BACKGROUND CSS (No changes) ----------------------
 def set_background(image_path):
-    """Sets the custom background image and chat styling using base64 encoding."""
+    """Sets the custom background image and chat styling."""
     try:
         if not os.path.exists(image_path):
             return
@@ -181,11 +162,9 @@ def set_background(image_path):
 
         st.markdown(f"""
             <style>
-            /* Streamlit layout adjustments */
             [data-testid="stAppViewContainer"] {{ padding: 0 !important; margin: 0 !important; background-color: transparent !important; }}
             [data-testid="stHeader"] {{ background: rgba(0,0,0,0) !important; }}
 
-            /* Full-page background image */
             .stApp {{
                 background-image: url("data:{mime_type};base64,{encoded_image}");
                 background-size: cover !important;
@@ -194,7 +173,6 @@ def set_background(image_path):
                 background-attachment: fixed !important;
             }}
 
-            /* Content container styling for better readability */
             .main .block-container {{
                 background: transparent !important;
                 padding-top: 3rem;
@@ -202,20 +180,17 @@ def set_background(image_path):
                 padding-right: 4rem;
             }}
 
-            /* Text styling for visibility against background */
             h1, h2, h3, p, label {{
                 color: #111 !important;
                 text-shadow: 0.5px 0.5px 1px rgba(255,255,255,0.8);
             }}
 
-            /* Custom chat bubble styling */
             .chat-bubble-user {{
                 background: rgba(230,247,255,0.8);
                 padding: 10px;
                 border-radius: 10px;
                 margin: 5px 0;
                 text-align: right;
-                border-right: 4px solid #007FFF; /* Light blue border */
             }}
 
             .chat-bubble-ai {{
@@ -223,17 +198,17 @@ def set_background(image_path):
                 padding: 12px;
                 border-radius: 10px;
                 margin: 5px 0;
-                border-left: 4px solid #32CD32; /* Lime green border for AI */
+                border-left: 4px solid #32CD32;
             }}
             </style>
         """, unsafe_allow_html=True)
 
     except Exception as e:
-        # Silently fail if image assets are missing or cannot be processed
-        print(f"Error setting background (likely missing asset files): {e}")
+        # Suppress error if image assets are missing
+        pass
 
 
-# ---------------------- STREAMLIT APP ENTRY POINT ----------------------
+# ---------------------- STREAMLIT APP ----------------------
 
 def main():
 
@@ -257,45 +232,38 @@ def main():
 
     st.divider()
 
-    # --- Data Loading ---
+    # Load data
     df_filtered, load_msg = load_sales_data(SALES_DATA_PATH, REQUIRED_COLS)
     if df_filtered is None:
         st.error(load_msg)
         st.stop()
 
-    total_leads = len(df_filtered)
-
-    # --- Chat State Initialization ---
+    # Chat section
     st.write("### 💬 Chat with Sales Buddy")
 
     if "chat" not in st.session_state:
         # Professional and informative initial message
-        initial_message = (
-            f"Welcome! I have successfully loaded **{total_leads}** CRM leads from `{SALES_DATA_PATH}`. "
-            f"Ask me about lead status, revenue analysis, or targeting the best leads!"
-        )
+        initial_message = f"Welcome! I have successfully loaded **{len(df_filtered)}** CRM leads. How can I assist you with lead analysis today?"
         st.session_state.chat = [
             {"role": "ai", "content": initial_message}
         ]
 
-    # --- Render Chat History ---
+    # Render chat
     for msg in st.session_state.chat:
         if msg["role"] == "user":
             st.markdown(f"<div class='chat-bubble-user'>{msg['content']}</div>", unsafe_allow_html=True)
         else:
             st.markdown(f"<div class='chat-bubble-ai'>{msg['content']}</div>", unsafe_allow_html=True)
 
-    # --- Chat Input and Logic ---
+    # Chat input
     query = st.chat_input("Ask your CRM-related question...")
 
     if query:
         st.session_state.chat.append({"role": "user", "content": query})
 
-        # Process the query and data context
-        data_ctx, count_sent = filter_data_context(df_filtered, query)
-
-        with st.spinner(f"Analyzing {count_sent} lead records..."):
-            reply = ask_gemini(query, data_ctx, count_sent)
+        with st.spinner("Analyzing..."):
+            data_ctx = filter_data_context(df_filtered, query)
+            reply = ask_gemini(query, data_ctx)
 
         st.session_state.chat.append({"role": "ai", "content": reply})
         st.rerun()
