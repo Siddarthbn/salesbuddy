@@ -23,8 +23,9 @@ BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
 
 # --- TOKEN-SAVING CONFIGURATION ---
-# To prevent 429 errors, limit the dataset size sent to the LLM
+# To prevent 429 quota errors, limit the dataset size sent to the LLM
 MAX_LEADS_TO_SEND = 150  # Limit to 150 leads for LLM analysis. Adjust based on quota.
+# Only send the most essential columns to save tokens.
 CORE_ANALYSIS_COLS = ["Record Id", "Full Name", "Company", "Lead Status", "Annual Revenue", "City"]
 
 
@@ -79,7 +80,6 @@ def get_secret_value(secret_name, secret_key, region_name):
 def load_sales_data_from_s3(bucket_name, file_key, required_cols):
     """Loads the Excel file directly from S3 into a Pandas DataFrame."""
     try:
-        # Uses the updated AWS_REGION
         s3 = boto3.client('s3', region_name=AWS_REGION)
 
         response = s3.get_object(Bucket=bucket_name, Key=file_key)
@@ -93,7 +93,6 @@ def load_sales_data_from_s3(bucket_name, file_key, required_cols):
             return None, f"❌ Missing essential columns: {', '.join(missing)}. Check your file structure."
 
         df_filtered = df[required_cols]
-        # Use errors='coerce' to turn non-numeric values into NaN, then fill with 0
         df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce').fillna(0)
 
         return df_filtered, None
@@ -106,13 +105,11 @@ def filter_data_context(df, query):
     df_working = df.copy()
     query_lower = query.lower()
 
-    # --- 1. Smart Filtering (Retains previous logic) ---
-    # Filter by lead quality
+    # --- 1. Smart Filtering ---
     key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility"]
     if any(p in query_lower for p in key_phrases):
         df_working = df_working[~df_working["Lead Status"].isin(DISQUALIFYING_STATUSES)]
 
-    # Filter by location
     locations = ["bangalore", "bengaluru", "delhi", "new york", "london", "texas", "india"]
     loc_match = next((loc for loc in locations if loc in query_lower), None)
 
@@ -129,17 +126,14 @@ def filter_data_context(df, query):
 
 
     # --- 2. Token Optimization: Column Reduction ---
-    # Only send the most essential columns for model analysis
     cols_to_send = [col for col in CORE_ANALYSIS_COLS if col in df_working.columns]
     df_working = df_working[cols_to_send]
     
     
     # --- 3. Token Optimization: Row Sampling ---
     if len(df_working) > MAX_LEADS_TO_SEND:
-        # Sort by Annual Revenue (descending) before sampling to prioritize high-value leads
+        # Prioritize high-value leads by sorting before sampling
         df_working = df_working.sort_values(by='Annual Revenue', ascending=False)
-        
-        # Take the top N leads
         df_working = df_working.head(MAX_LEADS_TO_SEND)
 
     return df_working.to_csv(index=False, sep="\t")
@@ -147,19 +141,15 @@ def filter_data_context(df, query):
 
 def ask_gemini(question, data_context):
     try:
-        # Fetch the key securely using the new path and region
+        # Fetch the key securely
         gemini_api_key = get_secret_value(GEMINI_SECRET_NAME, GEMINI_SECRET_KEY, AWS_REGION)
 
         if not gemini_api_key:
             return "❌ API Key Error: Gemini API key could not be retrieved from AWS Secrets Manager."
 
         genai.configure(api_key=gemini_api_key)
-        
-        # Retry logic: While full error handling is complex, a simple retry is often enough
-        # In production, use an exponential backoff loop here.
         model = genai.GenerativeModel("gemini-2.5-flash")
 
-        # The prompt is simplified because the data context is now much smaller
         prompt = f"""
 You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
 The data provided is a filtered or sampled subset of the full database. 
@@ -173,17 +163,35 @@ Your analysis must be limited to the provided subset.
 
 Provide clear, structured, bullet-point insights based ONLY on the data provided.
 """
+        
         response = model.generate_content(prompt)
-        return response.text
+        
+        # --- ENHANCED RESPONSE CHECK ---
+        if response.text:
+            return response.text
+        
+        # Handle cases where the model generates a response object but no text (e.g., safety block)
+        if response.candidates:
+            finish_reason = response.candidates[0].finish_reason.name
+            
+            if finish_reason == "SAFETY":
+                safety_ratings = response.candidates[0].safety_ratings
+                reasons = [f"{r.category.name}: {r.probability.name}" for r in safety_ratings]
+                return f"❌ Analysis Blocked: The model failed to generate a response due to safety policies. Safety Reasons: {', '.join(reasons)}"
+            
+            if finish_reason != "STOP":
+                 return f"⚠️ Model Generation Failed: The model stopped for reason: {finish_reason}. Try rephrasing your question."
+        
+        # Fallback for unknown empty response
+        return "⚠️ Generation Error: The model returned an empty response. Please try again or rephrase your question."
 
     except Exception as e:
+        # Catches API key errors, connection issues, or unhandled 429s/403s.
         return f"❌ Gemini API Error: {e}"
-        # Note: If the 429 persists even with small context, the only solution is to upgrade the quota.
 
 
 # ---------------------- BACKGROUND CSS ----------------------
 def set_background(image_path):
-# ... (set_background function remains unchanged)
     try:
         if not os.path.exists(image_path):
             return
@@ -276,7 +284,7 @@ def main():
     st.write("### 💬 Chat with Sales Buddy")
 
     if "chat" not in st.session_state:
-        # --- REFINED INITIAL MESSAGE ---
+        # Refined professional initial message
         initial_message = f"Welcome! I have successfully loaded **{len(df_filtered)}** CRM leads. How can I assist you with lead analysis today?"
         
         st.session_state.chat = [
