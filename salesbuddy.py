@@ -6,18 +6,21 @@ import base64
 import mimetypes
 import boto3
 import io
+import json
 
-# ---------------------- AWS S3 CONFIG --------------------------
+# ---------------------- AWS CONFIG (UPDATED) --------------------------
 # Set these variables to match your AWS setup
 S3_BUCKET_NAME = "zodopt"
-S3_FILE_KEY = "Leads by Status.xlsx"               
-AWS_REGION = "ap-south-1"                      
+S3_FILE_KEY = "Leads by Status.xlsx"
+
+# --- AWS Secrets Manager Configuration ---
+AWS_REGION = "ap-south-1" # <--- UPDATED REGION (Mumbai)
+GEMINI_SECRET_NAME = "salesbuddy/secrets" # <--- UPDATED SECRET PATH
+GEMINI_SECRET_KEY = "GEMINI_API_KEY" # Key used within the JSON structure of the secret
 
 # Paths for local assets (used only for images/styling)
 BACKGROUND_IMAGE_PATH = "background.jpg"
 LOGO_IMAGE_PATH = "zodopt.png"
-
-GEMINI_API_KEY = "AIzaSyBgKTlULVARw37Ec0WCor0YFC3cHXq64Mc" # Use environment variables in production
 
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
@@ -27,22 +30,57 @@ REQUIRED_COLS = [
 
 DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
 
+# ---------------------- SECRETS MANAGER FUNCTION --------------------------
+
+@st.cache_resource
+def get_secret_value(secret_name, secret_key, region_name):
+    """
+    Retrieves the secret from AWS Secrets Manager using the specified region.
+    """
+    try:
+        # Client now uses the globally updated AWS_REGION
+        client = boto3.client(
+            service_name='secretsmanager',
+            region_name=region_name
+        )
+
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except Exception as e:
+        st.error(f"❌ Secrets Manager Error: Failed to retrieve secret '{secret_name}' in region **{region_name}**. Ensure the IAM Role has 'secretsmanager:GetSecretValue' permission. Details: {e}")
+        st.stop()
+        return None
+
+    if 'SecretString' in get_secret_value_response:
+        secret = get_secret_value_response['SecretString']
+
+        # Parse the JSON string to get the specific key's value
+        try:
+            secret_dict = json.loads(secret)
+            if secret_key in secret_dict:
+                return secret_dict[secret_key]
+            else:
+                st.error(f"❌ Secrets Manager Error: Key '{secret_key}' not found in the secret JSON for '{secret_name}'.")
+                st.stop()
+        except json.JSONDecodeError:
+            st.error(f"❌ Secrets Manager Error: Secret string for '{secret_name}' is not valid JSON.")
+            st.stop()
+    return None
+
 # ---------------------- FUNCTIONS --------------------------
 
 @st.cache_data(ttl=600)
 def load_sales_data_from_s3(bucket_name, file_key, required_cols):
     """Loads the Excel file directly from S3 into a Pandas DataFrame."""
     try:
-        # boto3 automatically picks up credentials from the EC2 Instance Profile (IAM Role)
+        # Uses the updated AWS_REGION
         s3 = boto3.client('s3', region_name=AWS_REGION)
-        
-        # Download the file object from S3
+
         response = s3.get_object(Bucket=bucket_name, Key=file_key)
-        
-        # Read the Excel data into a BytesIO object (in-memory file)
         excel_data = response['Body'].read()
         df = pd.read_excel(io.BytesIO(excel_data))
-        
+
         df.columns = df.columns.str.strip()
 
         missing = [c for c in required_cols if c not in df.columns]
@@ -52,12 +90,11 @@ def load_sales_data_from_s3(bucket_name, file_key, required_cols):
         df_filtered = df[required_cols]
         # Use errors='coerce' to turn non-numeric values into NaN, then fill with 0
         df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce').fillna(0)
-        
+
         return df_filtered, None
 
     except Exception as e:
-        # Catch S3/Boto3 errors (e.g., AccessDenied, NoSuchKey)
-        return None, f"❌ S3/Boto3 Error: Failed to load data from s3://{bucket_name}/{file_key}. Details: {e}"
+        return None, f"❌ S3/Boto3 Error: Failed to load data from s3://{bucket_name}/{file_key} in **{AWS_REGION}**. Details: {e}"
 
 
 def filter_data_context(df, query):
@@ -88,8 +125,15 @@ def filter_data_context(df, query):
 
 def ask_gemini(question, data_context):
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-2.5-flash") # Hardcoding the model as requested
+        # Fetch the key securely using the new path and region
+        gemini_api_key = get_secret_value(GEMINI_SECRET_NAME, GEMINI_SECRET_KEY, AWS_REGION)
+
+        if not gemini_api_key:
+            # Error message is handled inside get_secret_value
+            return "❌ API Key Error: Gemini API key could not be retrieved from AWS Secrets Manager."
+
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
 
         prompt = f"""
 You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
