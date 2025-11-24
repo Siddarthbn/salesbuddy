@@ -11,11 +11,11 @@ import json
 # ---------------------- AWS CONFIG (UPDATED) --------------------------
 # Set these variables to match your AWS setup
 S3_BUCKET_NAME = "zodopt"
-S3_FILE_KEY = "Leaddata/Leads by Status.xlsx"
+S3_FILE_KEY = "Leaddata/Leads by Status.xlsx" # Corrected S3 path
 
 # --- AWS Secrets Manager Configuration ---
-AWS_REGION = "ap-south-1" # <--- UPDATED REGION (Mumbai)
-GEMINI_SECRET_NAME = "salesbuddy/secrets" # <--- UPDATED SECRET PATH
+AWS_REGION = "ap-south-1" # Mumbai region
+GEMINI_SECRET_NAME = "salesbuddy/secrets" # Corrected Secret path
 GEMINI_SECRET_KEY = "GEMINI_API_KEY" # Key used within the JSON structure of the secret
 
 # Paths for local assets (used only for images/styling)
@@ -38,7 +38,6 @@ def get_secret_value(secret_name, secret_key, region_name):
     Retrieves the secret from AWS Secrets Manager using the specified region.
     """
     try:
-        # Client now uses the globally updated AWS_REGION
         client = boto3.client(
             service_name='secretsmanager',
             region_name=region_name
@@ -129,10 +128,11 @@ def ask_gemini(question, data_context):
         gemini_api_key = get_secret_value(GEMINI_SECRET_NAME, GEMINI_SECRET_KEY, AWS_REGION)
 
         if not gemini_api_key:
-            # Error message is handled inside get_secret_value
             return "❌ API Key Error: Gemini API key could not be retrieved from AWS Secrets Manager."
 
         genai.configure(api_key=gemini_api_key)
+        # Note: The 'Gemini API Error: 403' means the key is compromised. 
+        # Assuming you've replaced the key in Secrets Manager, this should now work.
         model = genai.GenerativeModel("gemini-2.5-flash")
 
         prompt = f"""
@@ -215,7 +215,7 @@ def set_background(image_path):
         st.error(f"Background error: {e}")
 
 
-# ---------------------- STREAMLIT APP ----------------------
+# ---------------------- STREAMLIT APP (MODIFIED) ----------------------
 
 def main():
 
@@ -249,8 +249,11 @@ def main():
     st.write("### 💬 Chat with Sales Buddy")
 
     if "chat" not in st.session_state:
+        # --- REFINED INITIAL MESSAGE ---
+        initial_message = f"Welcome! I have successfully loaded **{len(df_filtered)}** CRM leads. How can I assist you with lead analysis today?"
+        
         st.session_state.chat = [
-            {"role": "ai", "content": f"Hello! I've loaded {len(df_filtered)} leads from S3. Ask me anything about your CRM leads."}
+            {"role": "ai", "content": initial_message}
         ]
 
     # Render chat
