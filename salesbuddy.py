@@ -4,7 +4,6 @@ import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
-# ❌ REMOVED: from google.generativeai.types import Part (Still removed to avoid errors)
 import base64
 import mimetypes
 import boto3 
