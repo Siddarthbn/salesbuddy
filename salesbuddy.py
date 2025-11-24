@@ -4,9 +4,7 @@ import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
-# FIX: Ensure this import works. If it fails, your SDK might be very old 
-# or needs an update. This path is standard for newer versions.
-from google.generativeai.types import Part 
+# ❌ REMOVED: from google.generativeai.types import Part (This caused the error)
 import base64
 import mimetypes
 import boto3 
@@ -147,9 +145,10 @@ def ask_gemini(question, df_context, api_key):
         uploaded_file = client.files.upload(file=csv_path)
         
         # 3. Create the prompt with the file reference
+        # FIX: Using genai.types.Part since direct import failed
         prompt = [
-            Part.from_text("You are ZODOPT Sales Buddy. Strictly analyze the attached CSV file of CRM lead data."),
-            Part.from_text(f"--- QUESTION ---\n{question}\n\nProvide structured bullet-point insights based ONLY on the data."),
+            genai.types.Part.from_text("You are ZODOPT Sales Buddy. Strictly analyze the attached CSV file of CRM lead data."),
+            genai.types.Part.from_text(f"--- QUESTION ---\n{question}\n\nProvide structured bullet-point insights based ONLY on the data."),
             uploaded_file
         ]
 
