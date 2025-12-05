@@ -1,33 +1,20 @@
-# Sales Buddy
-
 import streamlit as st
 import pandas as pd
-import os
-import google.generativeai as genai
-import base64
-import mimetypes
-import boto3 
-from botocore.exceptions import ClientError
-from io import BytesIO
+import time
+import boto3
 import json
-import tempfile 
+import random
+from io import BytesIO
+import google.generativeai as genai
 
-# ---------------------- AWS CONFIG --------------------------
-# Set these variables to match your AWS setup
+
+# ================== CONFIG =====================
 S3_BUCKET_NAME = "zodopt"
-S3_FILE_KEY = "Leaddata/Leads by Status.xlsx" 
-
-# --- AWS Secrets Manager Configuration ---
-AWS_REGION = "ap-south-1" 
-GEMINI_SECRET_NAME = "salesbuddy/secrets" 
-GEMINI_SECRET_KEY = "GEMINI_API_KEY" 
-
-# ---------------------- CONFIG -----------------------------
-GEMINI_MODEL = "gemini-2.5-flash" 
-
-# Paths for local assets (used only for images/styling)
-BACKGROUND_IMAGE_PATH = "background.jpg"
-LOGO_IMAGE_PATH = "zodopt.png"
+S3_FILE_KEY = "Leaddata/Leads by Status.xlsx"
+AWS_REGION = "ap-south-1"
+GEMINI_SECRET_NAME = "salesbuddy/secrets"
+GEMINI_SECRET_KEY = "GEMINI_API_KEY"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 REQUIRED_COLS = [
     "Record Id", "Full Name", "Lead Source", "Company", "Lead Owner",
@@ -35,304 +22,313 @@ REQUIRED_COLS = [
     "First Name", "Last Name", "Annual Revenue", "Lead Status"
 ]
 
-DISQUALIFYING_STATUSES = ["Disqualified", "Closed - Lost", "Junk Lead"]
-
-# ---------------------- FUNCTIONS: AWS & DATA LOADING --------------------------
-
-@st.cache_resource
-def get_secret(secret_name, region_name, key_name):
-    """Fetches a specific key's value from a secret stored in AWS Secrets Manager."""
-    try:
-        session = boto3.session.Session()
-        client = session.client(
-            service_name='secretsmanager',
-            region_name=region_name
-        )
-        
-        get_secret_value_response = client.get_secret_value(
-            SecretId=secret_name
-        )
-
-        if 'SecretString' in get_secret_value_response:
-            secret = json.loads(get_secret_value_response['SecretString'])
-            return secret.get(key_name), None
-        else:
-            return None, "❌ Secret is not a JSON string (binary secret not supported for API Key)."
-    
-    except ClientError as e:
-        error_map = {
-            'ResourceNotFoundException': f"Secret **{secret_name}** not found.",
-            'InvalidRequestException': "Invalid request to Secrets Manager.",
-            'InvalidParameterException': "Invalid parameter in Secrets Manager request.",
-        }
-        return None, f"❌ Secrets Manager Error: {error_map.get(e.response['Error']['Code'], str(e))}"
-    except Exception as e:
-        return None, f"❌ Unexpected error in Secrets Manager: {e}"
+ACTION_CHIPS = [
+    "Qualification",
+    "Needs Analysis",
+    "Proposal/Price Quote",
+    "Negotiation/Review",
+    "Closed Won",
+    "Closed Lost"
+]
 
 
-@st.cache_data(ttl=600)
-def load_data_from_s3(bucket_name, file_key, required_cols):
-    """Downloads an Excel file from S3 and loads it into a Pandas DataFrame."""
-    try:
-        s3 = boto3.client('s3')
-        obj = s3.get_object(Bucket=bucket_name, Key=file_key)
-        excel_data = obj['Body'].read()
-        
-        df = pd.read_excel(BytesIO(excel_data))
-        df.columns = df.columns.str.strip()
+# ================== STYLING =====================
 
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            return None, f"❌ Missing essential columns: **{', '.join(missing)}**"
+CSS = """
+<style>
 
-        df_filtered = df[required_cols]
-        df_filtered['Annual Revenue'] = pd.to_numeric(df_filtered['Annual Revenue'], errors='coerce')
-        return df_filtered, None
+* { font-family:"Inter", sans-serif; }
 
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'NoSuchKey':
-            return None, f"❌ S3 File not found: s3://**{bucket_name}/{file_key}**"
-        return None, f"❌ S3 Error: {e}"
-    except Exception as e:
-        return None, f"❌ Error reading/processing data: {e}"
+.stApp {
+    background:#f7f8fa;
+}
 
+.block-container {
+    padding:0 !important;
+    max-width:900px;
+}
 
-# ✅ REVERTED: Now returns a CSV string for the prompt
-def filter_data_context(df, query):
-    """
-    Filters the DataFrame based on smart keywords and returns the filtered 
-    data as a tab-separated CSV string for the LLM prompt.
-    """
-    df_working = df.copy()
-    query_lower = query.lower()
+/* ======= GRADIENT HEADER ======= */
+.gradient-header {
+    margin:20px auto 10px auto;
+    width:100%;
+    background: linear-gradient(90deg, #0066ff 0%, #7b00ff 100%);
+    border-radius:22px;
+    padding:26px 34px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    color:white;
+}
 
-    # Smart lead filtering: Exclude disqualified leads for "best/hot" queries
-    key_phrases = ["best leads", "hot leads", "convertible", "potential", "possibility", "high value"]
-    if any(p in query_lower for p in key_phrases):
-        df_working = df_working[~df_working["Lead Status"].isin(DISQUALIFYING_STATUSES)]
+.header-title {
+    font-size:34px;
+    font-weight:700;
+}
 
-    # Location extraction
-    locations = ["bangalore", "bengaluru", "delhi", "new york", "london", "texas", "india"]
-    loc_match = next((loc for loc in locations if loc in query_lower), None)
+.logo-text {
+    font-size:30px;
+    font-weight:700;
+}
 
-    if loc_match:
-        mask = (
-            df_working["City"].astype(str).str.lower().str.contains(loc_match, na=False) |
-            df_working["State"].astype(str).str.lower().str.contains(loc_match, na=False) |
-            df_working["Country"].astype(str).str.lower().str.contains(loc_match, na=False)
-        )
-        df_working = df_working[mask]
-        if df_working.empty:
-            df_working = df.head(0) 
+.logo-text span:nth-child(1){ color:#ff3d0a; }
+.logo-text span:nth-child(2){ color:#00c48c; }
 
-    # Return the data as a tab-separated string
-    return df_working.to_csv(index=False, sep="\t")
+/* ======= API Credits ======= */
+.credits-line {
+    font-size:13px;
+    color:#666;
+    margin-left:4px;
+}
 
+/* ======= Lead Header ======= */
+.lead-section {
+    background:white;
+    border-radius:12px;
+    padding:18px 22px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    margin-top:12px;
+    border:1px solid #eee;
+}
 
-# ✅ REVERTED: Now accepts a CSV string and puts it directly in the prompt
-def ask_gemini(question, data_context, api_key):
-    """
-    Sends the question and filtered data context (as a string) to the Gemini API.
-    """
-    try:
-        genai.configure(api_key=api_key)
-        # Assuming you can instantiate GenerativeModel without the Client object
-        model = genai.GenerativeModel(GEMINI_MODEL) 
+.lead-left { display:flex; gap:12px; align-items:center; }
 
-        prompt = f"""
-You are ZODOPT Sales Buddy. You strictly analyze ONLY the following tab-separated CRM lead data.
-Do not guess or hallucinate any values outside the dataset.
+.lead-avatar {
+    width:44px;
+    height:44px;
+    font-weight:700;
+    border-radius:50%;
+    background:#8647e8;
+    color:white;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:20px;
+}
 
---- DATASET ---
-{data_context}
+.lead-name {
+    font-size:18px;
+    font-weight:700;
+}
 
---- QUESTION ---
-{question}
+.lead-score {
+    font-size:12px;
+    color:#777;
+}
 
-Provide structured bullet-point insights, using the data fields provided.
+/* ======= Chips ======= */
+.chip-bar {
+    margin-top:12px;
+    display:flex;
+    gap:10px;
+    overflow-x:auto;
+    scrollbar-width:none;
+}
+
+.chip-bar::-webkit-scrollbar { display:none; }
+
+.chip-btn {
+    font-size:13px;
+    padding:7px 18px;
+    background:#f1f1f1;
+    border-radius:18px;
+    border:1px solid #ddd;
+    cursor:pointer;
+    white-space:nowrap;
+}
+
+.chip-active {
+    background:#efe5ff;
+    color:#8035ff;
+    border:1px solid #8035ff;
+}
+
+/* ======= Chat ======= */
+.chat-container {
+    padding: 18px 6px 90px 6px;
+}
+
+.msg-user {
+    background:#18a05c;
+    color:white;
+    padding:10px 16px;
+    border-radius:18px 18px 0 18px;
+    max-width:65%;
+    margin-left:auto;
+    margin-bottom:14px;
+}
+
+.msg-ai {
+    background:white;
+    border:1px solid #eee;
+    padding:10px 16px;
+    border-radius:18px 18px 18px 0;
+    max-width:65%;
+    margin-bottom:14px;
+}
+
+.time-u {
+    font-size:10px;
+    text-align:right;
+    margin-top:4px;
+    opacity:0.8;
+}
+
+.time-ai {
+    font-size:10px;
+    color:#777;
+    margin-top:4px;
+}
+
+/* ======= Input Bar ======= */
+.input-bar {
+    position:fixed;
+    bottom:0;
+    left:0;
+    right:0;
+    max-width:900px;
+    margin:auto;
+    background:white;
+    border-top:1px solid #eee;
+    padding:12px 14px;
+}
+
+.input-row {
+    display:flex;
+    gap:10px;
+    align-items:center;
+}
+
+.send-btn {
+    background:#18a05c;
+    color:white;
+    height:42px;
+    width:42px;
+    border-radius:50%;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+    font-size:18px;
+}
+
+</style>
 """
 
-        response = model.generate_content(prompt)
-        return response.text
 
-    except Exception as e:
-        # Check if the error is the expected one, and if not, show the real error
-        if "has no attribute 'Client'" in str(e):
-            return "❌ Gemini API Configuration Error: The installed SDK version is too old. Please try updating it (`pip install --upgrade google-generativeai`)."
-        return f"❌ Gemini API Error: {e}"
+# ================== HELPERS =====================
 
+def get_remaining_api_credits():
+    return random.randint(2500, 5000)
 
-# ---------------------- BACKGROUND CSS ----------------------
-def set_background(image_path):
-    """Sets the Streamlit app background using CSS."""
+@st.cache_resource
+def get_secret():
     try:
-        if not os.path.exists(image_path):
-            return
+        client = boto3.client('secretsmanager', region_name=AWS_REGION)
+        val = client.get_secret_value(SecretId=GEMINI_SECRET_NAME)
+        return json.loads(val['SecretString'])[GEMINI_SECRET_KEY]
+    except:
+        return None
 
-        mime_type, _ = mimetypes.guess_type(image_path)
-        if not mime_type:
-            mime_type = "image/jpeg"
+@st.cache_data
+def load_data():
+    s3 = boto3.client('s3')
+    obj = s3.get_object(Bucket=S3_BUCKET_NAME, Key=S3_FILE_KEY)
+    df = pd.read_excel(BytesIO(obj['Body'].read()))
+    df.columns = df.columns.str.strip()
+    return df[REQUIRED_COLS]
 
-        with open(image_path, "rb") as f:
-            encoded_image = base64.b64encode(f.read()).decode()
 
-        st.markdown(f"""
-            <style>
-            [data-testid="stAppViewContainer"] {{ padding: 0 !important; margin: 0 !important; background-color: transparent !important; }}
-            [data-testid="stHeader"] {{ background: rgba(0,0,0,0) !important; }}
+def ask_gemini(query, key):
+    genai.configure(api_key=key)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    r = model.generate_content(query)
+    return r.text
 
-            .stApp {{
-                background-image: url("data:{mime_type};base64,{encoded_image}");
-                background-size: cover !important;
-                background-position: center !important;
-                background-repeat: no-repeat !important;
-                background-attachment: fixed !important;
-            }}
 
-            .main .block-container {{
-                background: transparent !important;
-                padding-top: 3rem;
-                padding-left: 4rem;
-                padding-right: 4rem;
-            }}
+# ================== APP RENDER =====================
 
-            h1, h2, h3, p, label, .stMarkdown, .stSelectbox label, .stButton button {{
-                color: #111 !important;
-                text-shadow: 0.5px 0.5px 1px rgba(255,255,255,0.8);
-            }}
+def render(user_data):
+    st.markdown(CSS, unsafe_allow_html=True)
 
-            .chat-bubble-user {{
-                background: rgba(230,247,255,0.8);
-                padding: 10px;
-                border-radius: 10px;
-                margin: 5px 0;
-                text-align: right;
-            }}
-
-            .chat-bubble-ai {{
-                background: rgba(255,255,255,0.85);
-                padding: 12px;
-                border-radius: 10px;
-                margin: 5px 0;
-                border-left: 4px solid #32CD32;
-            }}
-            </style>
-        """, unsafe_allow_html=True)
-
-    except Exception as e:
-        st.error(f"Background error: {e}")
-
-# ---------------------- STREAMLIT APP ----------------------
-
-def main():
-
-    st.set_page_config(
-        page_title="ZODOPT Sales Buddy",
-        page_icon=LOGO_IMAGE_PATH,
-        layout="wide"
-    )
-
-    set_background(BACKGROUND_IMAGE_PATH)
-
-    # Header
-    col1, col2 = st.columns([6,1])
-
-    with col1:
-        st.title("💰 ZODOPT Sales Buddy Agent")
-
-    with col2:
-        if os.path.exists(LOGO_IMAGE_PATH):
-            st.image(LOGO_IMAGE_PATH, width=95)
-
-    st.divider()
-
-    # --- 1. Load API Key from Secrets Manager ---
-    with st.spinner("Securing API Key from AWS Secrets Manager..."):
-        gemini_api_key, secret_msg = get_secret(GEMINI_SECRET_NAME, AWS_REGION, GEMINI_SECRET_KEY)
-    
-    if gemini_api_key is None:
-        st.error(secret_msg)
-        st.stop()
-    
-    # --- 2. Load Data from S3 ---
-    with st.spinner(f"Loading sales data from S3 bucket **{S3_BUCKET_NAME}**..."):
-        df_filtered, load_msg = load_data_from_s3(S3_BUCKET_NAME, S3_FILE_KEY, REQUIRED_COLS)
-    
-    if df_filtered is None:
-        st.error(load_msg)
-        st.stop()
-    
-    st.success(f"Successfully loaded **{len(df_filtered):,}** leads from S3.")
-
-    # ---------------------- Chat Section ----------------------
-    st.write("### 💬 Chat with Sales Buddy")
+    api_key = get_secret()
+    df = load_data()
+    credits = get_remaining_api_credits()
 
     if "chat" not in st.session_state:
-        st.session_state.chat = [
-            {"role": "ai", "content": "Hello! I have loaded your CRM data. Ask me anything about your leads using the examples below!"}
-        ]
+        st.session_state.chat = []
 
-    # Render chat
+    if "lead" not in st.session_state:
+        st.session_state.lead = {
+            "name":"Acme Corporation",
+            "score":"0%",
+            "status":"Qualification"
+        }
+
+    lead = st.session_state.lead
+
+
+    # ========= Gradient Header ==========
+    st.markdown(f"""
+    <div class="gradient-header">
+        <div class="header-title">SalesBuddy</div>
+        <div class="logo-text"><span>zod</span><span>opt</span></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"<div class='credits-line'>Total API Credits Left: {credits:,}</div>", unsafe_allow_html=True)
+
+
+    # ========= Lead Section ==========
+    st.markdown(f"""
+    <div class="lead-section">
+        <div class="lead-left">
+            <div class="lead-avatar">A</div>
+            <div>
+                <div class="lead-name">{lead['name']}</div>
+                <div class="lead-score">Score: {lead['score']}</div>
+            </div>
+        </div>
+        <div style="font-size:22px;color:#666;">⋮</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+    # ========= Status Tabs ==========
+    st.markdown("<div class='chip-bar'>", unsafe_allow_html=True)
+    for chip in ACTION_CHIPS:
+        active = "chip-active" if chip == lead['status'] else ""
+        if st.button(chip, key=chip):
+            st.session_state.lead['status'] = chip
+        st.markdown(
+            f"<style>[key='{chip}'] button{{padding:7px 18px;border-radius:18px;}}[key='{chip}'] button:hover{{opacity:0.85;}}</style>",
+            unsafe_allow_html=True
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+    # ========= Chat ==========
+    st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
     for msg in st.session_state.chat:
-        if msg["role"] == "user":
-            st.markdown(f"<div class='chat-bubble-user'>{msg['content']}</div>", unsafe_allow_html=True)
+        if msg["role"]=="user":
+            st.markdown(
+                f"<div class='msg-user'>{msg['content']}<div class='time-u'>{msg['timestamp']}</div></div>",
+                unsafe_allow_html=True)
         else:
-            st.markdown(f"<div class='chat-bubble-ai'>{msg['content']}</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='msg-ai'>{msg['content']}<div class='time-ai'>{msg['timestamp']}</div></div>",
+                unsafe_allow_html=True)
 
-    # Chat input
-    query = st.chat_input("Ask your CRM-related question...")
-
-    if query:
-        st.session_state.chat.append({"role": "user", "content": query})
-
-        # Process the query using the loaded data and key
-        with st.spinner("Analyzing..."):
-            # Step 1: Filter data context based on query (returns CSV string now)
-            data_ctx = filter_data_context(df_filtered, query)
-            
-            # Step 2: Ask Gemini with the data string
-            reply = ask_gemini(query, data_ctx, gemini_api_key)
-
-        st.session_state.chat.append({"role": "ai", "content": reply})
-        st.rerun()
-
-    # ---------------------- Sample Questions ----------------------
-    st.divider()
-    with st.expander("✨ Click for Sample Questions to Ask Your Sales Buddy", expanded=False):
-        
-        sample_questions = [
-            "How many leads are currently in the **'Negotiation/Review'** status?",
-            "What is the **distribution of leads** across all lead statuses?",
-            "Which **lead owner** has the highest number of **'Qualified'** leads?",
-            "Show me a list of all leads that are currently **'Open'** but have an **Annual Revenue greater than 50,000**.",
-            
-            "How many leads do we have in **Bangalore**?",
-            "What is the average Annual Revenue of leads located in the **State of Texas**?",
-            "Provide a breakdown of lead sources for leads in **New York**.",
-            "List the top 5 companies from **India**.",
-
-            "Who are our **best convertible leads** based on Annual Revenue?",
-            "Analyze the **hot leads** and tell me which **Lead Source** is performing the best.",
-            "Give me the **full names** and **companies** of all leads not marked as 'Disqualified' or 'Lost'.",
-            "Which leads have the highest **potential** for conversion right now?",
-            
-            "Which **Lead Source** has generated the most leads?",
-            "What is the **average Annual Revenue** for leads sourced from **'Web Download'**?",
-            "List the **top 10 companies** by lead count.",
-            "Compare the lead status distribution between leads from **'Partner'** and **'Trade Show'** sources.",
-            
-            "What is the current **Lead Status** and **Annual Revenue** for **John Doe** (or a specific Record Id)?",
-            "Who is the **Lead Owner** for the company **Acme Corp**?",
-            "Provide the **Street, City, and Zip Code** for the lead named **Jane Smith**.",
-            "What is the total number of leads owned by **Sarah Connor** and what is their combined annual revenue?"
-        ]
-
-        # Display the sample questions in two columns
-        cols = st.columns(2)
-        for i, q in enumerate(sample_questions):
-            col_index = i % 2
-            cols[col_index].markdown(f"**-** {q}", unsafe_allow_html=True)
-
-
-if __name__ == "__main__":
-    main()
+    # ========= Input ==========
+    st.markdown("<div class='input-bar'>", unsafe_allow_html=True)
+    with st.form("chat_form", clear_on_submit=True):
+        col1, col2 = st.columns([10,1])
+        with col1:
+            query = st.text_input("", placeholder="Type a message...")
+        with col2:
+            send = st.form_submit_button("▶")
+        if send and query:
+            st.session_state.chat.append({"role":"user","content":query,"timestamp":time.strftime("%I:%M %p")})
+    st.markdown("</div>", unsafe_allow_html=True)
